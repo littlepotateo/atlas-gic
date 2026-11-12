@@ -63,6 +63,7 @@ import math
 import os
 import tempfile
 from contextlib import ExitStack
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -73,6 +74,7 @@ from atlas.backtest.checkpoint import Checkpoint, dump_date, load_date
 from atlas.backtest.predlog import PredictionLog
 from atlas.config import Limits, Settings
 from atlas.data.store import PriceStore, Snapshot
+from atlas.errorlog import ErrorLog, NullErrorLog
 from atlas.engine.llm import BudgetExceeded, CachedLLM, FatalApiError, StubClient
 from atlas.engine.pipeline import DayResult, Pipeline, _last_close, orders_from_targets
 from atlas.portfolio.models import Fill, Order, Portfolio
@@ -91,9 +93,15 @@ WEIGHTED_KINDS = ("macro", "sector", "superinvestor")  # CIO/execution are score
 DRY_RUN_RESPONSE = json.dumps({"view": "neutral", "confidence": 0.0, "picks": []})
 
 LIMITATIONS = [
-    "model_cutoff: the shipped default (2026-06-01) is a PLACEHOLDER GUESS, and the whole verdict "
-    "rests on it (only days after it can be evidence). Set it from the documented training-data "
-    "cutoff of the exact model used.",
+    "model_cutoff: the whole verdict rests on it (only days after it can be evidence). The shipped "
+    "default (2026-06-30) is the documented cutoff of the packaged model; set it from the "
+    "documented training-data cutoff of the exact model used.",
+    "The training-cutoff table in atlas/config.py is month-granular (the month end is used) and "
+    "copied from the Anthropic Models overview page, which can change: the cutoff validator is a "
+    "guard, not a guarantee. A model missing from the table only warns.",
+    "The contamination probe covers every model in use (hub, spoke and per-agent overrides), so "
+    "its cost scales with the number of models; a partial or failed probe leaves some models "
+    "unchecked.",
     "Spend is an estimate: the budget cap counts tokens at configured per-model prices "
     "(Settings.prices()), not Anthropic's bill (cache, platform and price changes are not "
     "modelled); also set a spend limit on the Anthropic account.",
@@ -238,12 +246,23 @@ class BacktestResult:
     periods: Periods | None = None
 
 
-def estimate_cost(cfg: BacktestConfig, n_days: int, n_agents: int) -> float:
+def estimate_cost(cfg: BacktestConfig, n_days: int, n_agents: int,
+                  agent_models: Sequence[str] | None = None) -> float:
     """Upper-level estimate from Settings.prices() (per-model table or explicit prices); 0 for a dry run. Ignores
-    cache hits and retries (cached days are free, retries cost extra)."""
+    cache hits and retries (cached days are free, retries cost extra). `agent_models` (one
+    model per agent, so its length must equal n_agents) prices each agent at
+    ``settings.prices_for(model)``."""
+    if agent_models is not None and len(agent_models) != n_agents:
+        raise ValueError(f"agent_models has {len(agent_models)} entries for {n_agents} agents")
     if cfg.dry_run:
         return 0.0
     s = cfg.settings
+    if agent_models is not None:
+        total = 0.0
+        for m in agent_models:
+            p_in, p_out = s.prices_for(m)
+            total += (s.est_input_tokens_per_call * p_in + s.est_output_tokens_per_call * p_out) / 1e6
+        return float(n_days) * total
     p_in, p_out = s.prices()  # UnknownModelPrice for an unpriced model
     per_call = (s.est_input_tokens_per_call * p_in + s.est_output_tokens_per_call * p_out) / 1e6
     return float(n_days) * float(n_agents) * per_call
@@ -319,6 +338,8 @@ class _State:
     basket: dict[date, float] = field(default_factory=dict)
     bench_ref: dict[str, float] = field(default_factory=dict)
     spent_usd: float = 0.0
+    # per-model split of spent_usd (hub-and-spoke runs only; absent in single-model checkpoints)
+    spent_by_model: dict[str, float] | None = None
     predlog_head: tuple[int, str | None] = (0, None)
     halted: bool = False
     halt_reason: str | None = None
@@ -328,7 +349,7 @@ class _State:
 
     def to_json(self) -> dict:
         ds = lambda m: {dump_date(k): v for k, v in sorted(m.items())}  # noqa: E731
-        return {
+        out = {
             "version": STATE_VERSION, "fingerprint": self.fingerprint,
             "last_completed_day": dump_date(self.last_completed_day) if self.last_completed_day else None,
             "portfolio": {"cash": self.cash, "positions": dict(sorted(self.positions.items()))},
@@ -341,6 +362,9 @@ class _State:
             "skipped": ds(self.skipped), "risk_errors": ds(self.risk_errors),
             "last_known_prices": self.last_known,
         }
+        if self.spent_by_model is not None:
+            out["spent_by_model"] = dict(sorted(self.spent_by_model.items()))
+        return out
 
     @classmethod
     def from_json(cls, s: dict) -> "_State":
@@ -360,7 +384,21 @@ class _State:
             halted=bool(s["halted"]), halt_reason=s["halt_reason"],
             skipped=dl(s["skipped"]), risk_errors=dl(s["risk_errors"]),
             last_known=dict(s["last_known_prices"]),
+            spent_by_model=_load_by_model(s.get("spent_by_model")),
         )
+
+
+def _load_by_model(raw) -> dict[str, float] | None:
+    """The optional per-model spend of a checkpoint (None if absent: older checkpoints)."""
+    if raw is None:
+        return None
+    try:
+        out = {str(k): float(v) for k, v in raw.items()}
+    except (AttributeError, TypeError, ValueError):
+        raise ResumeRefused("checkpoint spent_by_model is corrupt") from None
+    if not all(math.isfinite(v) and v >= 0 for v in out.values()):
+        raise ResumeRefused("checkpoint spent_by_model is corrupt")
+    return out
 
 
 def clear_halt(checkpoint: Checkpoint) -> None:
@@ -391,6 +429,15 @@ def _check_predlog(predlog: PredictionLog, head: tuple[int, str | None]) -> None
         raise ResumeRefused(
             f"prediction log {path} does not match the checkpoint (expected line {head[0]} with hash "
             f"{head[1]}, at most one uncommitted line after it): truncated or rewritten; refusing to resume")
+
+
+def _emit(elog: ErrorLog, method: str, *args, **kw) -> None:
+    """Pure additive error-log call: a logging failure must never change run behaviour, state
+    or exceptions, so any Exception is swallowed (noted once per call on the module logger)."""
+    try:
+        getattr(elog, method)(*args, **kw)
+    except Exception as e:  # noqa: BLE001
+        log.warning("error log %s failed (%s); ignored", method, type(e).__name__)
 
 
 def _pause_failed(pipeline: Pipeline, day: DayResult) -> dict[str, str] | None:
@@ -447,6 +494,15 @@ FINGERPRINT_SETTINGS = ("model", "effort", "dead_zone", "shrinkage_k", "warmup_p
                         "slippage_bps", "commission_per_share", "commission_min", "min_valid_agents")
 
 
+def _spec_dump(sp) -> dict:
+    """Per-agent fingerprint input. ``model`` joined AgentSpec later; it is left out while unset so
+    checkpoints written before it existed (and single-model runs) hash exactly as before."""
+    d = sp.model_dump(mode="json")
+    if d.get("model") is None:
+        d.pop("model", None)
+    return d
+
+
 def _fingerprint(cfg: BacktestConfig, pipeline: Pipeline, initial_cash, universe, universe_sectors,
                  lookback_days, macro_series) -> dict:
     """Everything a resumed run must share with the run that wrote the checkpoint, as flat
@@ -457,9 +513,11 @@ def _fingerprint(cfg: BacktestConfig, pipeline: Pipeline, initial_cash, universe
           "universe": sorted(universe), "lookback_days": int(lookback_days),
           "macro_series": [str(m) for m in macro_series],
           "universe_sectors": dict(sorted(universe_sectors.items())) if universe_sectors else None,
-          "agents": _sha(sorted((sp.model_dump(mode="json") for sp in pipeline.specs.values()),
+          "agents": _sha(sorted((_spec_dump(sp) for sp in pipeline.specs.values()),
                                 key=lambda d: d["name"]))}
     fp.update({f"settings.{k}": getattr(s, k) for k in FINGERPRINT_SETTINGS})
+    if s.spoke_model:  # only when set, so checkpoints from before hub/spoke keep their fingerprint
+        fp["settings.spoke_model"] = s.spoke_model
     fp.update({f"limits.{k}": v for k, v in cfg.limits.model_dump().items()})
     fp.update({f"prompt.{n}": _sha(t) for n, t in sorted(pipeline.prompts.items())})
     return json.loads(json.dumps(fp))  # normalise to what a checkpoint round-trip yields
@@ -471,16 +529,19 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
                  scores: ScoreStore, weightbook: WeightBook, predlog: PredictionLog,
                  checkpoint: Checkpoint, *, confirm: bool = False, initial_cash: float = 100_000.0, universe_sectors: dict[str, str] | None = None,
                  lookback_days: int = 60, macro_series=(), run_dir: Path | None = None,
-                 history_path: Path | None = None) -> BacktestResult:
+                 history_path: Path | None = None, error_log: ErrorLog | None = None) -> BacktestResult:
     """Run (or resume) the backtest over train, validation and holdout in date order.
 
     One continuous portfolio spans all three periods; use ``cfg.periods.period_of`` to split
     the result per period. ``history_path`` (optional) receives one JSON line per day (see
     ``read_day_history``): the weights and state the pipeline was given and the day's fills.
-    All LLM calls and spend accounting go through ONE object,
-    ``pipeline.llm``: its spend is restored from the checkpoint so the budget spans resumes. ``run_dir`` holds the dry-run stub cache (a temp dir if omitted).
+    All spend accounting goes through ONE Budget, that of
+    ``pipeline.llm`` (in a hub-and-spoke run every model's CachedLLM in ``pipeline.llms`` shares
+    it): the checkpoint's total is restored into it once so the cap spans resumes, and
+    multi-model runs also checkpoint ``spent_by_model``. ``run_dir`` holds the dry-run stub cache (a temp dir if omitted).
     Raises CostConfirmationRequired, RunPaused, ResumeRefused (see module docstring).
     """
+    elog = error_log if error_log is not None else NullErrorLog()
     s = cfg.settings
     universe = list(dict.fromkeys(s.universe))
     snap_tickers = universe + ([BENCHMARK] if BENCHMARK not in universe else [])
@@ -513,7 +574,9 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
     todo = [d for d in all_days if st.last_completed_day is None or d > st.last_completed_day]
 
     agent_specs = [sp for sp in pipeline.specs.values() if sp.kind != "control"]
-    est = estimate_cost(cfg, len(todo), len(agent_specs))
+    routed = pipeline.models
+    est = estimate_cost(cfg, len(todo), len(agent_specs),
+                        None if routed is None else [routed.get(sp.name, s.model) for sp in agent_specs])
     if est > s.confirm_cost_usd and not confirm:
         raise CostConfirmationRequired(est, s.confirm_cost_usd)
 
@@ -537,6 +600,7 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
             active_llm = CachedLLM(StubClient(lambda _s, _u: DRY_RUN_RESPONSE), d / "dry_run_llm.db",
                                    "dry-run", (0.0, 0.0), math.inf)
             active.llm = active_llm
+            active.llms = None  # the stub serves every agent
         limitations = list(LIMITATIONS)
         sectors: dict[str, str] = {}
         fwd: dict[str, str] = {}
@@ -550,10 +614,30 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
                             if sp.benchmark else sp for n, sp in pipeline.specs.items()}
 
         if raw is not None:
+            # ONCE, on the budget every model's CachedLLM shares (raise-only, so never doubled)
             active_llm.restore_spent(st.spent_usd)
             weightbook.save(st.weights)  # undo any update made by an uncommitted day
             if st.halted:
                 log.warning("run is HALTED (%s): no orders until clear_halt()", st.halt_reason)
+
+        # per-model spend (hub-and-spoke runs): the checkpoint's split plus what each model spent
+        # since the restore; without a stored split (an older checkpoint) the shared budget's own
+        # split, in which the restored total is Budget.UNATTRIBUTED
+        budget = active_llm.budget
+        per_model = not cfg.dry_run and len(set((pipeline.models or {}).values()) | {pipeline.llm.model}) > 1
+        stored_by_model = st.spent_by_model
+        at_restore = budget.spent_by_model()
+
+        def by_model() -> dict[str, float] | None:
+            if not per_model:
+                return None
+            if stored_by_model is None:
+                return budget.spent_by_model()
+            out = dict(stored_by_model)
+            for m, v in budget.spent_by_model().items():
+                if v > at_restore.get(m, 0.0):
+                    out[m] = out.get(m, 0.0) + (v - at_restore.get(m, 0.0))
+            return out
 
         portfolio = Portfolio(cash=st.cash, positions=dict(st.positions))
         cost_frac = 2 * s.slippage_bps / 1e4
@@ -563,7 +647,9 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
 
         def pause(reason: str, day: date, failed: dict[str, str], kind: str) -> RunPaused:
             committed.spent_usd = active_llm.spent_usd
+            committed.spent_by_model = by_model()
             checkpoint.save(committed.to_json())
+            _emit(elog, "event", "run_paused", reason, level="warning", day=day, pause_kind=kind, failed=failed)
             return RunPaused(reason, day, failed, kind)
 
         for T in todo:
@@ -595,12 +681,22 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
             try:
                 day = active.run_day(T, pipe_in, weights, agent_state, asof_label=label)
             except BudgetExceeded as e:
+                _emit(elog, "exception", "budget_exceeded", e, day=T)
                 raise pause(f"LLM budget exceeded: {e}", T, {}, "budget") from e
-            except FatalApiError:  # not a pause: commit nothing of T, keep the spend, propagate
+            except FatalApiError as e:  # not a pause: commit nothing of T, keep the spend, propagate
                 committed.spent_usd = active_llm.spent_usd
-                checkpoint.save(committed.to_json())
+                committed.spent_by_model = by_model()
+                checkpoint.save(committed.to_json())  # persist the spend before anything else
+                _emit(elog, "exception", "fatal_api_error", e, day=T)
                 raise
             failed = _pause_failed(active, day)
+            if day.skipped_reason is not None and failed is None:
+                # Error-log events are append-only and the checkpoint is the commit point: after a
+                # crash and re-run of the same day, day_skipped / risk_error / halted events for
+                # that day may appear twice.
+                _emit(elog, "event", "day_skipped", day.skipped_reason, level="warning", day=T,
+                      failed={n: (r.failure.reason.value if r.failure is not None else "no_output")
+                              for n, r in sorted(day.results.items()) if r.status != "ok"})
             if failed is not None:
                 raise pause(f"transient infrastructure failures decided the day ({day.skipped_reason})",
                             T, failed, "transient")
@@ -635,10 +731,13 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
                 except Exception as e:  # noqa: BLE001 - fail closed on ANY risk-layer error
                     log.exception("%s: risk layer failed; no orders sent", T)
                     st.risk_errors[T] = f"{type(e).__name__}: {e}"
+                    _emit(elog, "exception", "risk_error", e, day=T)
                 else:
                     if decision.halted:
                         st.halted, st.halt_reason = True, decision.halt_reason
                         log.error("%s: HALT: %s", T, decision.halt_reason)
+                        _emit(elog, "event", "halted", f"kill switch fired: {decision.halt_reason}",
+                              level="error", day=T, halt_reason=decision.halt_reason)
                     for o, why in decision.rejected:
                         log.info("%s: risk rejected %s: %s", T, o, why)
                     to_send = list(decision.orders)
@@ -686,6 +785,7 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
             st.cash, st.positions = portfolio.cash, dict(portfolio.positions)
             st.weights = new_w
             st.spent_usd = active_llm.spent_usd
+            st.spent_by_model = by_model()
             st.predlog_head = predlog.head()
             st.last_completed_day = T
             day_results[T] = DayResult(T, day.regime, results,

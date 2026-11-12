@@ -241,6 +241,8 @@ atlas backtest --config my_run_pass2.yaml           # adaptive Darwinian weights
 atlas report --run-dir runs/pass2                   # report.md, equity.png, agents.csv, autoresearch.csv
 atlas autoresearch --config my_run_pass2.yaml       # optional: prompt edits judged on train days only
 atlas probe --run-dir runs/pass2 --samples 30       # (optional) contamination probe -> contamination.json
+atlas probe --run-dir runs/pass2 --model claude-haiku-5-5   # (optional) probe just one model in use
+atlas errors --run-dir runs/pass2 --tail 20 --kind run_paused   # read-only view of errors.log
 ```
 
 * Weights stay frozen until a dead zone is calibrated by the null test (pass 1). The calibrated
@@ -252,14 +254,64 @@ atlas probe --run-dir runs/pass2 --samples 30       # (optional) contamination p
   the report next to the real agents'.
 * `autoresearch` needs a clean git working tree, edits only `atlas/prompts/`, never pushes, and needs
   at least 40 train days. `anonymize: true` is refused for now (the prompt files name tickers).
+* Validation confirmation (`settings.confirm_on_validation`, default on): an edit that wins on train
+  days is NOT kept until the same paired replay also wins on the most recent validation days (only
+  days whose scoring exit is also inside validation; holdout is never touched). It must beat
+  `keep_margin` there too and pass the same edit gate, otherwise the decision is `unconfirmed` and
+  the edit is discarded. Requirements: at least `confirm_min_days` (default 20) usable validation
+  days, and, because the gate needs at least `rolling_ic_window` validation pairs, about
+  `rolling_ic_window / picks_per_day` days (window 60 with 1-2 picks a day needs 30-60 clean days).
+  `atlas autoresearch` refuses (exit 1) when the validation period is too short (at most 60 days are
+  replayed, so `confirm_min_days` above 60 can never pass); the opt-out is
+  `settings.confirm_on_validation: false`, which may be changed in the config after the backtest
+  (like `confirm_min_days`, `min_pair_ratio` and `impute_abstentions`, which only autoresearch reads;
+  any other changed setting is still refused) and means edits are judged on train days alone. Each
+  log record stores the gate settings used and the report says when confirmation was disabled. Each confirmation reuses the SAME validation days, so every attempt spends some of
+  them: validation is a repeatedly used sample, `max_edits` caps the attempts per command, and the
+  report's Autoresearch section counts the confirmations run over the whole log.
+* Replay gate settings: `min_pair_ratio` (default 0.95) rejects an edit whose new prompt yields fewer
+  than that share of the old prompt's scored pairs, and `impute_abstentions` (default true) scores a
+  ticker only one prompt picked as if the other prompt had repeated the pick, so abstaining is
+  neutral and cannot inflate the paired IC by itself. Dropping many picks is caught by
+  `min_pair_ratio`, not by the IC.
 * `probe` (optional) shows the model anonymised snapshots of the run's own days (opaque ids, rebased
   prices, relative day index, sector labels; never a real ticker or date) and asks it to guess the
   calendar date and real ticker. A high hit rate means the model can recognise those periods, so
-  trust their results less; it is not a measure of skill. Its spend counts against `budget_usd`,
-  and `atlas report` adds a "Contamination probe (optional)" section once `contamination.json`
+  trust their results less; it is not a measure of skill. It probes EVERY model in use (hub, spoke
+  and per-agent overrides) on the same snapshots, so its cost scales with the number of models;
+  `--model NAME` probes just one (and then overwrites the file's per-model results with that one).
+  `contamination.json` has a `models` map with one entry per model (hits, rates, spend, and flags
+  `incomplete`, `skipped` or `failed_fatal` for a model whose probe was cut short by the budget, not
+  run, or stopped by an API rejection). Its spend counts against `budget_usd`, and `atlas report`
+  adds a "Contamination probe (optional)" section (one row per model; a model in use that was not
+  fully probed is flagged there, and the probe then does not cover the whole system) once the file
   exists. The older-model check (optional, `atlas.backtest.oldmodel.run_older_model_check`) reruns
   only the window after an older model's cutoff in `<run_dir>/older_model/<model>/`; the model
   name is yours to supply and availability is not checked.
+* Hub and spoke models (optional): `settings.model` powers the hub (cro, cio, execution). Set
+  `settings.spoke_model` (e.g. `claude-haiku-5-5`) to run the nine macro, sector and superinvestor
+  agents and the control agent on a cheaper model. The effective model of an agent is, in order:
+  its own `model:` in `agents.yaml`, else `spoke_model` (for macro, sector, superinvestor and
+  control agents), else `settings.model`. A `spoke_model` not in the built-in price table needs both
+  `spoke_usd_per_mtok_input` and `spoke_usd_per_mtok_output`. Measured estimate (12 agents a day,
+  effort low): all Sonnet 5.5 is about $0.16/day (a 148-day run about $24), all Haiku 5.5 about
+  $0.008/day, Sonnet hub with Haiku spokes about $0.057/day. All models share one hard budget.
+  Results from a mixed run cannot be attributed to the hub or the spokes: the report lists each
+  agent's model and says so.
+* Training-cutoff table: `MODEL_TRAINING_CUTOFFS` in `atlas/config.py` holds the documented
+  training-data cutoff of each known model (Jun 2026 for Haiku 5.5, Sonnet 5.5, Opus 5.5 and
+  Fable 5.1). It is month-granular, so the month end is used, and it was copied by hand from the
+  Anthropic Models overview page (https://platform.claude.com/docs/en/about-claude/models/overview,
+  read 2026-11-07). Re-check that page whenever you change a model, and update the table and
+  `model_cutoff`. A run is refused if any model in use has a documented cutoff later than
+  `model_cutoff`; a model the table does not list only produces a warning (it cannot be checked).
+  The check is a guard, not a guarantee.
+* Error log: every run writes `<run_dir>/errors.log` (dry runs under `dry_run/`), one JSON object per
+  line (time, level, kind, day, agent, reason, message, fields), sanitised, mode 0600, rotated at
+  5 MB to `errors.log.1`. It records failed calls, skipped days, pauses and operational errors, and
+  logging can never change or stop a run. Read it with `atlas errors --run-dir DIR` (read-only;
+  `--kind` filters) or in the report's "Errors" section ("not provided" when the file is absent).
+  It never holds raw model replies: those stay in `failures.sqlite`.
 * A run directory remembers its validated config (`run_config.json`): re-running, calibrating or
   researching it with a different config is refused. Unknown config keys are rejected.
 * Exit codes: 0 success, 1 operational failure (the message says how to fix it), 2 usage, config
@@ -282,9 +334,15 @@ atlas probe --run-dir runs/pass2 --samples 30       # (optional) contamination p
 
 **Limitations** (also listed in every report)
 
-* `model_cutoff` in `atlas/config/settings.yaml` (2026-06-01) is a PLACEHOLDER GUESS and the
-  whole verdict rests on it: set it from the documented training-data cutoff of the exact model
-  you use. The CLI prints a warning while it is the shipped default.
+* `model_cutoff` in `atlas/config/settings.yaml` (2026-06-30) is the documented training cutoff
+  of the packaged model and the whole verdict rests on it: set it from the documented cutoff of
+  the exact model you use. A run is refused if a model in use (including `spoke_model` and
+  per-agent `model` overrides) has a documented cutoff in `atlas/config.py` later than
+  `model_cutoff`; the CLI warns for a model that table does not list. The table is
+  month-granular and copied from a web page that can change: the validator is a guard, not a
+  guarantee.
+* The contamination probe covers every model in use, so its cost scales with the number of models.
+  A mixed hub-and-spoke run cannot be attributed to either model.
 * Pricing is configured, not billed: the hard cap is an estimate (see `budget_usd` above).
 * No sampling settings are sent (current models reject `temperature`): replays are deterministic
   only because identical inputs are served from the response cache; an uncached re-run may differ.

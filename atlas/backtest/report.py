@@ -24,6 +24,8 @@ from atlas.backtest.contamination import ContaminationScore  # noqa: E402,F401
 from atlas.backtest.nulltest import NullDistribution  # noqa: E402
 from atlas.backtest.runner import BacktestResult  # noqa: E402
 from atlas.config import Settings  # noqa: E402
+from atlas.engine.llm import Budget, sanitise  # noqa: E402
+from atlas.errorlog import escape_controls  # noqa: E402
 from atlas.scoring.metrics import hit_rate, rank_ic  # noqa: E402
 from atlas.scoring.store import ScoreStore  # noqa: E402
 from atlas.scoring.weights import shrunk_ic  # noqa: E402
@@ -37,6 +39,8 @@ DISCLAIMER = "This backtest is not evidence of future profitability."
 CONTROL_AGENT = "control"
 PAIR_CAVEAT = ("a prompt that abstains selectively inside a day can inflate paired IC; "
                "kept edits must be confirmed on the holdout")
+PAIR_CAVEAT_VALIDATED = ("a prompt that abstains selectively inside a day can inflate paired IC; "
+                         "kept edits also passed a validation replay but are still not confirmed on the holdout")
 EXTRA_LIMITATIONS = [
     "This backtest is a plumbing test: it checks that the machinery runs end to end.",
     "Pre-cutoff results are not evidence of skill (the model may have seen those dates).",
@@ -49,6 +53,16 @@ EXTRA_LIMITATIONS = [
     "The holdout IC of kept autoresearch edits is not computed (a known gap versus the spec): a "
     "kept edit is judged on train days only until it is re-run on the holdout.",
 ]
+GAP_LIMITATION_VALIDATED = (
+    "The holdout IC of kept autoresearch edits is not computed (a known gap versus the spec): a "
+    "kept edit was judged on train days and passed a validation replay, but is not holdout-confirmed "
+    "until it is re-run on the holdout.")
+AUTORESEARCH_GAP_VALIDATED = (
+    "Kept edits show 'holdout IC not computed': this is a known gap versus the spec. "
+    "The keep decision used train days and a validation replay (not the holdout), and this report does "
+    "not re-run the edited prompt on the holdout. To confirm a kept edit, run a backtest with the "
+    "edited prompts in a new run_dir (the old checkpoint fingerprints the prompts) and "
+    "read that run's holdout IC for the agent; until then treat the edit as not holdout-confirmed.")
 AUTORESEARCH_GAP = ("Kept edits show 'holdout IC not computed': this is a known gap versus the spec. "
                     "The keep decision used train days only, and this report does not re-run the "
                     "edited prompt on the holdout. To confirm a kept edit, run a backtest with the "
@@ -150,7 +164,110 @@ def _table(df: pd.DataFrame) -> str:
     return "\n".join(lines) + "\n"
 
 
+_CONF_COLS = ["agent", "decision", "validation days", "old IC", "new IC", "diff", "margin", "confirmation"]
+
+
+def _confirm_of(e) -> dict | None:
+    c = getattr(e, "confirm", None)
+    return c if isinstance(c, dict) else None
+
+
+def _num_of(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def _validation_confirmed(edits: list) -> bool:
+    """True when the log shows validation confirmation was on for at least one attempt."""
+    for e in edits:
+        c = _confirm_of(e)
+        if c is not None and (_num_of(c.get("n_days_requested")) or 0) > 0:
+            return True
+        g = getattr(e, "gates", None)
+        if isinstance(g, dict) and g.get("confirm_on_validation") is True:
+            return True
+    return False
+
+
+def _extra_limitations(validated: bool) -> list[str]:
+    out = list(EXTRA_LIMITATIONS)
+    if validated:
+        out = [x.replace(PAIR_CAVEAT, PAIR_CAVEAT_VALIDATED) for x in out]
+        out = [GAP_LIMITATION_VALIDATED if x.startswith("The holdout IC of kept") else x for x in out]
+    return out
+
+
+def _confirmation_section(edits: list) -> list[str]:
+    """Validation confirmation of train wins: a count over the WHOLE log and one row per edit that
+    has a `confirm` record (old logs without one simply have no rows)."""
+    confs = [(e, _confirm_of(e)) for e in edits]
+    ran = sum(1 for _, c in confs if c is not None and (_num_of(c.get("n_days_requested")) or 0) > 0)
+    if not edits:
+        return ["No autoresearch attempts are logged.\n"]
+    out = [f"Validation confirmations run: {ran} (of {len(edits)} logged attempts, whole log).",
+           "Validation is a repeatedly used sample: every confirmation replays the same most recent "
+           "validation days, so each one partly spends them and a lucky edit becomes more likely the "
+           "more attempts are made.", ""]
+    gates = [getattr(e, "gates", None) for e in edits]
+    gates = [g if isinstance(g, dict) else None for g in gates]
+    off = sum(1 for g in gates if g is not None and g.get("confirm_on_validation") is False)
+    if off:
+        out += [f"**Validation confirmation was DISABLED for {off} logged attempts; those edits were "
+                "judged on train days alone.**", ""]
+    rows = []
+    for e, c in confs:
+        if c is None:
+            continue
+        d = _num_of(c.get("n_days"))
+        rows.append([_err_text(e.agent), _err_text(e.decision), "n/a" if d is None else int(d),
+                     _f(_num_of(c.get("old_ic"))), _f(_num_of(c.get("new_ic"))),
+                     _f(_num_of(c.get("diff"))), _f(_num_of(c.get("margin"))), _err_text(c.get("reason"))])
+    if rows:
+        out += [_table(pd.DataFrame(rows, columns=_CONF_COLS))]
+    elif off == len(edits) and edits:
+        out += ["Confirmation was off for every logged attempt, so no confirmation records exist.\n"]
+    elif any(g is not None for g in gates):
+        out += ["No logged edit has a validation confirmation record (no attempt won on train).\n"]
+    else:
+        out += ["No logged edit has a validation confirmation record (older log without gate records, "
+                "or no attempt won on train).\n"]
+    return out
+
+
 # ------------------------------------------------------------------------------ periods
+
+_ERR_COLS = ["ts_utc", "level", "kind", "day", "agent", "reason", "message"]
+_ERR_LAST = 10
+
+
+def _err_text(v, limit: int = 300) -> str:
+    """Re-sanitised, control- and bidi-escaped text of one logged value; never raises."""
+    try:
+        return escape_controls(sanitise("" if v is None else str(v), limit))
+    except Exception:
+        return "<unprintable>"
+
+
+def _errors_section(errors: list[dict] | None) -> list[str]:
+    head = ["## Errors\n"]
+    if errors is None:
+        return head + ["not provided\n"]
+    if not errors:
+        return head + ["no errors logged\n"]
+    recs = [e if isinstance(e, dict) else {} for e in errors]
+    out = head + [f"{len(recs)} events in `errors.log` (run directory).\n"]
+    for col in ("kind", "level"):
+        counts: dict[str, int] = {}
+        for e in recs:
+            k = _err_text(e.get(col), 80) or "?"
+            counts[k] = counts.get(k, 0) + 1
+        df = pd.DataFrame(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])),
+                          columns=[col, "count"])
+        out += [f"By {col}:\n", _table(df)]
+    last = pd.DataFrame([[_err_text(e.get(c)) for c in _ERR_COLS] for e in recs[-_ERR_LAST:]],
+                        columns=_ERR_COLS)
+    return out + [f"Last {min(_ERR_LAST, len(recs))} events (full detail in `errors.log`):\n",
+                  _table(last)]
+
 
 def _period_ranges(result: BacktestResult, cutoff: date | None):
     """[(name, lo, hi, contaminated, is_holdout)]. Without configured periods the whole run
@@ -199,7 +316,7 @@ def _real(df: pd.DataFrame, col: str) -> pd.Series:
 
 # ------------------------------------------------------------------------------ report
 
-def _contamination_section(c, settings: Settings | None) -> list[str]:
+def _contamination_single(c, settings: Settings | None, coverage: list[str]) -> list[str]:
     head = "## Contamination probe (optional)\n"
     try:
         d = asdict(c) if hasattr(c, "__dataclass_fields__") else dict(c)
@@ -209,7 +326,7 @@ def _contamination_section(c, settings: Settings | None) -> list[str]:
         return [head, "n/a (contamination result unreadable).\n"]
     tol = d.get("tolerance_days", settings.tolerance_days if settings is not None else None)
     any_hits = d.get("any_hits")
-    out = [head]
+    out = [head, *coverage]
     if n <= 0:
         out.append("No probes completed (n = 0), so there is no contamination estimate.\n")
     else:
@@ -247,6 +364,101 @@ def _contamination_section(c, settings: Settings | None) -> list[str]:
     return out
 
 
+def _model_names(v) -> list[str]:
+    return [str(x) for x in v] if isinstance(v, list) else []
+
+
+def _coverage_lines(d: dict, models: dict) -> list[str]:
+    """Which models were probed, and a warning when a model the run uses was NOT (a probe
+    restricted with --model, or cut short by the budget): the section must not imply the whole
+    system was checked."""
+    probed = _model_names(d.get("probed_models")) or list(models)
+    in_use = _model_names(d.get("models_in_use")) or probed
+    def bad(m):
+        e = models.get(m)
+        return isinstance(e, dict) and (e.get("skipped") or e.get("failed_fatal"))
+    done = [m for m in probed if not bad(m)]
+    missing = [m for m in in_use if m not in done]
+    out = ["Models probed: " + (", ".join(_err_text(m, 200) for m in done) if done else "none") + ".\n"]
+    failed = [m for m in probed if isinstance(models.get(m), dict) and models[m].get("failed_fatal")]
+    if missing:
+        out.append("Warning: NOT probed: " + ", ".join(
+            _err_text(m, 200) + (f" (the API rejected a request: {_err_text(models[m].get('error'), 200)})"
+                                 if m in failed else "") for m in missing)
+                   + ". This probe does not cover the whole system: results that rely on these models "
+                   "have no contamination check.\n")
+    cut = [m for m in done if isinstance(models.get(m), dict) and models[m].get("incomplete")]
+    if cut:
+        out.append("Incomplete (stopped early by the LLM budget): " + ", ".join(
+            f"{_err_text(m, 200)} ({_err_text(models[m].get('n'), 20)} of "
+            f"{_err_text(models[m].get('requested_samples', '?'), 20)} probes)" for m in cut) + ".\n")
+    return out
+
+
+def _model_row(name: str, e) -> str:
+    try:
+        n = int(e["n"])
+        dh, th = int(e["date_hits"]), int(e["ticker_hits"])
+        dr = float(e.get("date_rate", dh / n if n else 0.0))
+        tr = float(e.get("ticker_rate", th / n if n else 0.0))
+        cd, ct = e.get("chance_date"), e.get("chance_ticker")
+        status = ("failed (API error)" if e.get("failed_fatal") else "skipped (budget)" if e.get("skipped") else "incomplete (budget)" if e.get("incomplete")
+                  else "complete")
+        cells = [str(n), str(dh), _f(dr, pct=True) if n else "n/a",
+                 _f(float(cd), pct=True) if cd is not None else "n/a", str(th),
+                 _f(tr, pct=True) if n else "n/a", _f(float(ct), pct=True) if ct is not None else "n/a",
+                 str(int(e.get("failed") or 0)), f"${float(e.get('spend_usd') or 0.0):.4f}", status]
+    except (KeyError, TypeError, ValueError, AttributeError):
+        cells = ["n/a (unreadable)"] + ["n/a"] * 9
+    return "| " + " | ".join([_cell(_err_text(name, 200)), *map(_cell, cells)]) + " |"
+
+
+def _contamination_section(c, settings: Settings | None) -> list[str]:
+    head = "## Contamination probe (optional)\n"
+    try:
+        d = asdict(c) if hasattr(c, "__dataclass_fields__") else dict(c)
+    except (TypeError, ValueError):
+        return [head, "n/a (contamination result unreadable).\n"]
+    models = d.get("models")
+    if not isinstance(models, dict) or not models:  # a probe of one model, written before per-model results
+        return _contamination_single(c, settings, [])
+    coverage = _coverage_lines(d, models)
+    if len(models) == 1:
+        top = d.get("model")
+        if settings is not None and isinstance(top, str) and top != settings.model:
+            coverage.append(f"These results are for {_err_text(top, 200)} only, not the hub model "
+                            f"({_err_text(settings.model, 200)}).\n")
+        return _contamination_single(c, settings, coverage)
+    tol = d.get("tolerance_days", settings.tolerance_days if settings is not None else None)
+    out = [head, *coverage,
+           f"One row per model, all probed on the same anonymised snapshots. The date-hit rate is the headline: "
+           f"a date guess is a hit within {tol} day(s) of the true date. The chance columns are what a random "
+           "guesser would manage (approximate): dates (2 x tolerance + 1) / trading days in the run, tickers "
+           "1 / universe size. The sector label may identify the ticker; ticker hits are not evidence of date "
+           "memory.\n",
+           "| model | probes (n) | date hits | date-hit rate | chance (dates) | ticker hits | ticker-hit rate "
+           "| chance (tickers) | unusable replies | spend, cumulative | status |", "|" + "---|" * 11]
+    out += [_model_row(m, e) for m, e in models.items()]
+    out.append("")
+    out.append("Spend is cumulative over every run of the probe in this run directory (the console line of "
+               "`atlas probe` shows only that run).\n")
+    for m, e in models.items():
+        bp = e.get("by_period") if isinstance(e, dict) else None
+        if isinstance(bp, dict) and bp:
+            try:
+                out.append(f"By period, {_err_text(m, 200)}: " + "; ".join(
+                    f"{_err_text(k, 40)} {int(v['date_hits'])}/{int(v['n'])} date hits "
+                    f"({_f(float(v['date_rate']), pct=True)})" for k, v in bp.items()) + ".\n")
+            except (KeyError, TypeError, ValueError, AttributeError):
+                out.append(f"By period, {_err_text(m, 200)}: n/a (unreadable).\n")
+    out.append("Interpretation: each model was shown anonymised price data (no dates, no tickers) and asked to "
+               "name the date and the ticker. A high date-hit rate, well above chance, means that model can "
+               "place these snapshots in time, so trust results for those periods less. A low rate does not "
+               "prove a model has not seen the period. This probe is a data-quality check, not a measure of "
+               "skill, and it does not enter the verdict.\n")
+    return out
+
+
 def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribution | None,
                  edits: list[EditRecord], ablation: dict | None, control_ic: float | None,
                  failures: pd.DataFrame, cost_usd: float, out_dir: Path, *,
@@ -258,18 +470,26 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
                  ablation_by_period: dict[str, dict | None] | None = None,
                  null_meta: dict | None = None, null_source: str | None = None,
                  autoresearch_null_meta: list[dict | None] | None = None,
-                 contamination: "ContaminationScore | dict | None" = None) -> Path:
+                 contamination: "ContaminationScore | dict | None" = None,
+                 errors: list[dict] | None = None,
+                 agent_models: dict[str, str] | None = None,
+                 spent_by_model: dict[str, float] | None = None) -> Path:
     """`ablation_by_period` (optional, period name -> ablation dict or None, plus "all") renders
     the CIO ablation per period with the holdout as the headline; without it the single
     `ablation` dict is shown as before. `contamination` (optional, a ContaminationScore or its
     dict form from contamination.json) adds a "Contamination probe (optional)" section; without
-    it the section is absent. It never changes the verdict."""
+    it the section is absent. `errors` (optional, the events of errors.log) fills the "Errors"
+    section (None -> "not provided"). Neither changes the verdict. `agent_models` (agent ->
+    model) and `spent_by_model` (model -> USD) matter only when more than one model is in use:
+    then the Agents table gets a `model` column, the Cost section one line per model and the
+    Limitations a mixed-models sentence; a single-model report is unchanged."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     cutoff = settings.model_cutoff if settings is not None else None
     k = settings.shrinkage_k if settings is not None else 20.0
     failures = failures if failures is not None else pd.DataFrame()
     holdout_edit_ics = holdout_edit_ics or {}
+    mixed = agent_models is not None and len(set(agent_models.values())) > 1
 
     ranges = _period_ranges(result, cutoff)
     eq, spy, bsk = _norm(result.equity), _norm(result.spy), _norm(result.basket)
@@ -366,6 +586,8 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
                       "failures": int(fcount.get(a, 0))})
     adf = pd.DataFrame(arows, columns=["agent", "n_scored", "hit_rate", "rank_ic", "shrunk_ic",
                                        "final_weight", "failures"])
+    if mixed:
+        adf.insert(1, "model", [_err_text(agent_models.get(a, "n/a"), 200) for a in adf["agent"]])
     adf.to_csv(out_dir / "agents.csv", index=False)
     md += ["## Agents\n",
            "Control-agent rows are shown but excluded from every real-agent mean/median. "
@@ -418,8 +640,9 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
         md.append(line)
     if any(e.decision == "kept" and holdout_edit_ics.get(e.agent) is None for e in edits):
         md.append("")
-        md.append(AUTORESEARCH_GAP)
+        md.append(AUTORESEARCH_GAP_VALIDATED if _validation_confirmed(edits) else AUTORESEARCH_GAP)
     md.append("")
+    md += _confirmation_section(edits)
 
     # ---- null
     md += ["## Null test\n"]
@@ -478,15 +701,29 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
     md += ["## Failures\n", "Failed calls by agent and reason:\n", _table(failures),
            "Dropped picks:\n", (_table(dropped_picks) if dropped_picks is not None else "not provided\n")]
 
+    # ---- errors
+    md += _errors_section(errors)
+
     # ---- cost
     n_days = len(result.day_results) or len(eq)
     per_day = f"{cost_usd / n_days:.4f}" if n_days else "n/a"
     md += ["## Cost\n", f"Total API cost: ${cost_usd:.2f} over {n_days} trading days "
            f"(${per_day} per trading day).\n"]
+    if mixed and spent_by_model:
+        unattr = Budget.UNATTRIBUTED
+        md += ["Cost by model (one hard budget covers all of them):\n"]
+        md += [f"- {_err_text(m, 200)}: ${v:.2f}" for m, v in sorted(spent_by_model.items()) if m != unattr]
+        if unattr in spent_by_model:
+            md.append(f"- {unattr}: ${spent_by_model[unattr]:.2f} (autoresearch, older-model checks and "
+                      "spend restored from a checkpoint written before per-model tracking)")
+        md.append("")
 
     # ---- limitations
     md += ["## Limitations\n"]
-    md += [f"- {x}" for x in list(result.limitations) + EXTRA_LIMITATIONS]
+    md += [f"- {x}" for x in list(result.limitations) + _extra_limitations(_validation_confirmed(edits))]
+    if mixed:
+        md.append("- Mixed models: results cannot be attributed to the hub or the spokes (models: "
+                  + ", ".join(_err_text(m, 200) for m in sorted(set(agent_models.values()))) + ").")
     md.append("")
     if result.halted:
         md.append(f"- Run HALTED: {result.halt_reason}")

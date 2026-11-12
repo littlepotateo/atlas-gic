@@ -6,7 +6,8 @@ Commands (``atlas <command> --help`` for options)::
     atlas calibrate --config RUN.yaml
     atlas autoresearch --config RUN.yaml
     atlas report --run-dir RUN_DIR
-    atlas probe --run-dir RUN_DIR [--samples N] [--yes]      (optional)
+    atlas probe --run-dir RUN_DIR [--samples N] [--model MODEL] [--yes]      (optional)
+    atlas errors --run-dir RUN_DIR [--tail N] [--kind KIND]  (read-only; needs no keys)
 
 The run config (documented by ``atlas/config/run.example.yaml``) names a run directory that
 holds everything a run writes::
@@ -24,8 +25,11 @@ holds everything a run writes::
     autoresearch_log.jsonl one line per autoresearch attempt
     autoresearch_failures.sqlite  failures of autoresearch replay calls (kept separate)
     probe.json             spend of the (optional) contamination probe (counts against the cap)
-    contamination.json     (optional) probe result: rate, n, tolerance, seed, model, spend
+    contamination.json     (optional) probe result: rate, n, tolerance, seed, model, spend; the top-level
+                           fields are the first probed model's (the hub unless --model; see `model`),
+                           per-model results are under `models`
     probe_failures.sqlite  (optional) unusable probe replies, with their reason codes
+    errors.log             JSON Lines error/event log (``atlas errors`` reads it; dry runs: dry_run/)
     prices/                price cache (unless data.cache_dir says otherwise)
     dry_run/               ALL state of `backtest --dry-run` (same layout): never the real run's
     report/                report.md, equity.png, agents.csv, autoresearch.csv
@@ -50,11 +54,20 @@ settings; `report` reads only the stored record. Unknown config keys are rejecte
 did-you-mean hint. One LLM hard cap (budget_usd) spans the backtest, the control agent and
 autoresearch of a run directory.
 
+Hub and spoke (settings.spoke_model, per-agent `model`): one client and one CachedLLM per model
+in use, all on ONE shared Budget (the cap above) and the same response cache file (the key
+includes the model). Every model in use must be priced before any spend; the control agent runs
+on its own effective model (the spoke model when set); autoresearch proposals use the hub
+(settings.model) and replays each agent's own model. A multi-model checkpoint also records
+spent_by_model, and the report then shows a model column and per-model cost.
+
 (optional) ``atlas probe`` asks the model to guess the date and ticker of ANONYMISED snapshots of
 the run's own days (opaque ids, rebased prices, relative day index, sector labels) and records
 how often it succeeds; a high rate means the model can recognise those periods, so trust their
 results less. It is the only feature that builds anonymised snapshots and it sends them only to
-the probe prompt. Its spend counts against the same hard cap.
+the probe prompt. Its spend counts against the same hard cap. It probes EVERY model in use (hub,
+spoke, per-agent overrides) on the same snapshots; ``--model`` restricts it to one, and the report
+then warns that the others were not checked.
 
 Anonymised runs are refused (ruling W): anonymised prompt variants do not exist yet and the
 real prompt files name tickers and ask for dates.
@@ -83,6 +96,7 @@ import math
 import os
 import re
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -102,13 +116,17 @@ from atlas.backtest.runner import (
     estimate_cost, preflight_prices, read_day_history, required_tickers, run_backtest,
 )
 from atlas.config import (
-    SHIPPED_MODEL_CUTOFF, AgentSpec, Limits, Settings, UnknownModelPrice, load_agents, load_limits,
+    AgentSpec, Limits, ModelCutoffError, Settings, UnknownModelPrice, check_model_cutoffs, load_agents,
+    load_limits,
 )
 from atlas.data.csv_provider import CacheOnlyPrices, CsvPriceProvider, NoMacro
 from atlas.data.fred_provider import FredFetchError
 from atlas.data.store import PriceStore
 from atlas.engine.failures import CALL_FAILURE, FailureLog
-from atlas.engine.llm import BudgetExceeded, CachedLLM, FatalApiError, LLMResponse, StubClient
+from atlas.errorlog import ErrorLog, NullErrorLog, escape_controls, read_events
+from atlas.engine.llm import (
+    Budget, BudgetExceeded, CachedLLM, FatalApiError, LLMResponse, StubClient, sanitise,
+)
 from atlas.engine.pipeline import Pipeline
 from atlas.portfolio.models import Portfolio
 from atlas.portfolio.simbroker import SimBroker
@@ -130,6 +148,10 @@ LLM_CACHE, WEIGHTS, RUN_CONFIG, CALIBRATION = "llm_cache.sqlite", "weights.json"
 CONTROL_STATE, AR_LOG, AR_FAILURES = "control.json", "autoresearch_log.jsonl", "autoresearch_failures.sqlite"
 OLDER_MODEL_DIR = "older_model"
 PROBE_STATE, CONTAMINATION, PROBE_FAILURES = "probe.json", "contamination.json", "probe_failures.sqlite"
+ERRORS_NAME = "errors.log"
+# the error log of the run this process is working on (set by build_run, reset by main): lets
+# main() record a known error before printing it. None until a run directory is known.
+ACTIVE_ERRORLOG: ErrorLog | None = None
 DRY_RUN_CACHE = "dry_run_llm.db"
 ABLATION_NOTE = ("CIO ablation: the decision layer's portfolio is the execution agent's stated long "
                  "target weights (scaled down to max_gross_pct); the baseline is the weight-averaged "
@@ -202,7 +224,7 @@ class RunConfig(_Strict):
     initial_cash: float = Field(100_000.0, gt=0)
     anonymize: bool = False
     universe: list[str] | None = None  # overrides settings.universe
-    budget_usd: float | None = Field(None, gt=0)  # overrides settings.budget_usd (hard cap)
+    budget_usd: float | None = Field(None, gt=0, allow_inf_nan=False)  # overrides settings.budget_usd (hard cap)
     settings: dict = Field(default_factory=dict)  # any other Settings field overrides
     settings_file: Path | None = None
     limits_file: Path | None = None
@@ -335,11 +357,18 @@ def resolve_settings(rc: RunConfig) -> Settings:
     except ValidationError as e:
         raise UsageError(f"invalid settings: {_errors(e)}") from None
     require_prices(settings)
-    if settings.model_cutoff == SHIPPED_MODEL_CUTOFF:
-        print(f"warning: settings.model_cutoff {SHIPPED_MODEL_CUTOFF} is the shipped placeholder, not the "
-              f"documented training-data cutoff of {settings.model}; the verdict rests on it. Set "
-              "settings.model_cutoff in the run config.", file=sys.stderr)
     return settings
+
+
+def check_cutoffs(settings: Settings, specs: list[AgentSpec]) -> None:
+    """Refuse (exit 2) a model whose documented cutoff is later than model_cutoff; print one
+    warning per model that cannot be checked."""
+    try:
+        warnings = check_model_cutoffs(settings, specs)
+    except ModelCutoffError as e:
+        raise UsageError(str(e)) from None
+    for w in warnings:
+        print(f"warning: {w}", file=sys.stderr)
 
 
 def require_prices(settings: Settings) -> tuple[float, float]:
@@ -351,9 +380,60 @@ def require_prices(settings: Settings) -> tuple[float, float]:
         raise UsageError(str(e)) from None
 
 
-def anthropic_client(settings: Settings):
+def agent_models(settings: Settings, specs: list[AgentSpec]) -> dict[str, str]:
+    """agent name -> effective model (Settings.agent_model), for every agent incl. control."""
+    return {sp.name: settings.agent_model(sp) for sp in specs}
+
+
+def models_in_use(settings: Settings, specs: list[AgentSpec]) -> list[str]:
+    """Distinct models a run uses: the hub (`settings.model`, which also writes autoresearch
+    proposals) first, then the others in agent order."""
+    return list(dict.fromkeys([settings.model, *agent_models(settings, specs).values()]))
+
+
+def require_model_prices(settings: Settings, specs: list[AgentSpec]) -> dict[str, tuple[float, float]]:
+    """Prices of EVERY model in use (hub, spoke, per-agent overrides, control), checked before
+    any spend: an unpriced model is a usage error because the shared cap could not be enforced."""
+    try:
+        return {m: settings.prices_for(m) for m in models_in_use(settings, specs)}
+    except UnknownModelPrice as e:
+        raise UsageError(str(e)) from None
+
+
+def models_table(settings: Settings, specs: list[AgentSpec]) -> list[str]:
+    """One line per model in use: its role and the agents it serves. Names are printed through
+    escape_controls(sanitise(...)): one line each, whatever a config string holds."""
+    esc = lambda x: escape_controls(sanitise(str(x), 200))  # noqa: E731
+    by = agent_models(settings, specs)
+    lines = ["models in use:"]
+    for m in models_in_use(settings, specs):
+        role = ("hub" if m == settings.model else "spoke" if m == settings.spoke_model else "per-agent override")
+        names = [n for n, mm in by.items() if mm == m]
+        lines.append(f"  {esc(m)} ({role}): "
+                     f"{', '.join(map(esc, names)) if names else 'autoresearch proposals only'}")
+    return lines
+
+
+def anthropic_client(settings: Settings, model: str | None = None):
+    """A client for `model` (default: the hub, `settings.model`). Every client reads the one
+    ANTHROPIC_API_KEY from the environment through the SDK; no key is stored or printed."""
     from atlas.engine.llm import AnthropicClient
-    return AnthropicClient(settings.model, effort=settings.effort)
+    return AnthropicClient(model or settings.model, effort=settings.effort)
+
+
+def client_for(llm_client, settings: Settings, model: str, *, dry_run: bool = False):
+    """The client serving `model`. `llm_client` (tests) is one client for every model or a
+    mapping model -> client; otherwise _NoCalls in a dry run, else a real per-model client."""
+    if isinstance(llm_client, Mapping):
+        try:
+            return llm_client[model]
+        except KeyError:
+            raise UsageError(f"no client was supplied for model '{model}'") from None
+    if llm_client is not None:
+        return llm_client
+    if dry_run:
+        return _NoCalls()
+    return anthropic_client(settings, model)
 
 
 def resolve_periods(rc: RunConfig) -> Periods:
@@ -421,10 +501,13 @@ class Run:
     periods: Periods
     store: PriceStore
     macro_series: list[str]
-    llm: CachedLLM | None = None
+    llm: CachedLLM | None = None  # the hub (settings.model): proposals, cap narrowing, restore
+    llms: dict[str, CachedLLM] | None = None  # model -> CachedLLM, all sharing llm.budget
+    models: dict[str, str] | None = None  # agent -> effective model (every agent, control too)
     failures: FailureLog | None = None
     pipeline: Pipeline | None = None
     notes: list[str] = field(default_factory=list)
+    errors: ErrorLog = field(default_factory=NullErrorLog)  # ONE instance per run: its lock is per instance
 
     @property
     def universe(self) -> list[str]:
@@ -481,6 +564,13 @@ def _price_provider(rc: RunConfig, offline: bool):
     return YFinanceProvider()
 
 
+def open_error_log(path: Path) -> ErrorLog:
+    """The run's error log (created lazily on the first event); becomes the process's active one."""
+    global ACTIVE_ERRORLOG
+    ACTIVE_ERRORLOG = ErrorLog(path)
+    return ACTIVE_ERRORLOG
+
+
 def build_run(rc: RunConfig, *, offline: bool = False, fred_key: str | None = None,
               llm_client=None, dry_run: bool = False, failures_name: str = FAILURES,
               settings: Settings | None = None) -> Run:
@@ -493,6 +583,8 @@ def build_run(rc: RunConfig, *, offline: bool = False, fred_key: str | None = No
     except (OSError, yaml.YAMLError, TypeError, ValidationError) as e:
         raise UsageError(f"cannot load limits file {lim_path}: {type(e).__name__}") from None
     specs = load_specs(rc)
+    check_cutoffs(settings, specs)
+    prices = require_model_prices(settings, specs)  # every model in use, before any spend
     prompts = load_prompts(rc, specs)
     periods = resolve_periods(rc)
     notes = []
@@ -504,20 +596,25 @@ def build_run(rc: RunConfig, *, offline: bool = False, fred_key: str | None = No
         else:
             notes.append(f"dry run: {FRED_KEY} is not set, so the run uses no macro series")
     store = PriceStore(_price_provider(rc, offline), macro, rc.cache_dir)
-    run = Run(rc, settings, limits, specs, prompts, periods, store, series, notes=notes)
+    run = Run(rc, settings, limits, specs, prompts, periods, store, series, notes=notes,
+              errors=open_error_log(rc.path(ERRORS_NAME)))
     if llm_client is not None or not offline:
-        client = llm_client
-        if client is None:
-            if dry_run:
-                client = _NoCalls()
-            else:
-                client = anthropic_client(settings)
-        run.llm = CachedLLM(client, rc.llm_cache_path, settings.model, require_prices(settings),
-                            settings.budget_usd)
-        run.failures = FailureLog(rc.path(failures_name))
+        # one client and one CachedLLM per model, all on ONE Budget (one hard cap across models)
+        # and the same cache file (the cache key includes the model)
+        budget = Budget(settings.budget_usd)
+        run.llms = {m: CachedLLM(client_for(llm_client, settings, m, dry_run=dry_run), rc.llm_cache_path, m,
+                                 prices[m], settings.budget_usd, budget=budget)
+                    for m in models_in_use(settings, specs)}
+        run.llm = run.llms[settings.model]
+        run.models = agent_models(settings, specs)
+        run.failures = FailureLog(rc.path(failures_name), error_log=run.errors)
         run.pipeline = Pipeline(specs, prompts, run.llm, run.failures, run.universe, settings.min_valid_agents,
-                                max_tokens=settings.max_output_tokens)
+                                max_tokens=settings.max_output_tokens, llms=run.llms, models=run.models)
     return run
+
+
+def mixed_models(settings: Settings, specs: list[AgentSpec]) -> bool:
+    return len(models_in_use(settings, specs)) > 1
 
 
 def _write_json(path: Path, obj) -> None:
@@ -546,7 +643,9 @@ def _last_completed(checkpoint: Checkpoint) -> date | None:
 # autoresearch are run, the response-cache location, the spend cap and confirmation ceiling.
 ALLOWED_DRIFT = ("run_config.run_dir", "run_config.null_test", "run_config.autoresearch",
                  "run_config.llm_cache", "settings.budget_usd", "settings.confirm_cost_usd",
-                 "settings.max_output_tokens", "macro_series")
+                 "settings.max_output_tokens", "macro_series",
+                 "settings.confirm_on_validation", "settings.confirm_min_days",
+                 "settings.min_pair_ratio", "settings.impute_abstentions")
 
 
 def run_record(rc: RunConfig, run: Run) -> dict:
@@ -577,6 +676,19 @@ LEGACY_RAW = ("run_config.settings", "run_config.universe", "run_config.budget_u
 
 def record_diff(stored: dict, current: dict) -> list[str]:
     a, b = _flat(stored), _flat(current)
+    # a setting added after the run was stored is not a difference while it holds its default
+    for k in list(b):
+        f = k.split(".", 1)[-1]
+        if k.startswith("settings.") and k not in a and f in Settings.model_fields \
+                and not Settings.model_fields[f].is_required() and b[k] == Settings.model_fields[f].default:
+            del b[k]
+    # same for an agent field added after the run was stored (AgentSpec.model) while it is None
+    for k in list(b):
+        parts = k.split(".")
+        if len(parts) == 3 and parts[0] == "agents" and k not in a and parts[2] in AgentSpec.model_fields \
+                and not AgentSpec.model_fields[parts[2]].is_required() \
+                and b[k] == AgentSpec.model_fields[parts[2]].default:
+            del b[k]
     skip = ALLOWED_DRIFT + LEGACY_RAW
     return sorted(k for k in set(a) | set(b) if a.get(k, "<absent>") != b.get(k, "<absent>")
                   and not any(k == p or k.startswith(p + ".") for p in skip))
@@ -610,8 +722,9 @@ def stored_run(rc: RunConfig, run: Run, command: str) -> dict:
                          f"{rc.path(RUN_CONFIG)})")
     src = RunConfig.model_validate(stored["run_config"]).model_copy(update={"run_dir": rc.run_dir})
     run.periods = resolve_periods(src)
-    run.settings = Settings(**{**stored["settings"], "budget_usd": run.settings.budget_usd,
-                               "confirm_cost_usd": run.settings.confirm_cost_usd})
+    from atlas.autoresearch.loop import GATE_SETTINGS
+    live = {k: getattr(run.settings, k) for k in ("budget_usd", "confirm_cost_usd", *GATE_SETTINGS)}
+    run.settings = Settings(**{**stored["settings"], **live})  # the live config wins on ALLOWED_DRIFT settings
     return stored
 
 
@@ -703,11 +816,76 @@ def spend_so_far(run_dir: Path) -> dict[str, float]:
     ar_cost = sum((float(r.get("cost_usd") or 0.0) for r in read_ar_log(run_dir / AR_LOG)), 0.0)
     older = sum((float((_load_checkpoint(Checkpoint(c)) or {}).get("spent_usd", 0.0))
                  for c in sorted((run_dir / OLDER_MODEL_DIR).glob("*/" + CHECKPOINT))), 0.0)
-    return {"backtest": float(raw.get("spent_usd", 0.0)),
-            "control": _read_spend(run_dir / CONTROL_STATE),
-            "autoresearch": ar_cost,
-            "probe": _read_spend(run_dir / PROBE_STATE),
-            "older_model": older}
+    spent = {"backtest": float(raw.get("spent_usd", 0.0)),
+             "control": _read_spend(run_dir / CONTROL_STATE),
+             "autoresearch": ar_cost,
+             "probe": _read_spend(run_dir / PROBE_STATE),
+             "older_model": older}
+    for name, v in spent.items():  # a NaN would make every remaining-cap comparison False
+        if not math.isfinite(v) or v < 0:
+            raise OperationalError(f"recorded {name} spend in {run_dir} is not a valid amount ({v!r}); "
+                                   "the run directory is corrupt")
+    return spent
+
+
+def read_probe_split(run_dir: Path, hub: str) -> dict[str, float]:
+    """Probe spend by model from probe.json: its ``by_model`` (any remainder of ``spent_usd`` that
+    by_model does not account for is Budget.UNATTRIBUTED); a probe.json written before per-model
+    probing has none and is all attributed to the hub. Always sums to the file's ``spent_usd``."""
+    path = Path(run_dir) / PROBE_STATE
+    total = _read_spend(path)
+    if not path.exists():
+        return {}
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if "by_model" not in raw:
+        return {hub: total} if total > 0 else {}
+    try:
+        split = {str(m): float(v) for m, v in raw["by_model"].items()}
+    except (AttributeError, TypeError, ValueError):
+        raise OperationalError(f"{PROBE_STATE} is corrupt: {path}") from None
+    if not all(math.isfinite(v) and v >= 0 for v in split.values()):
+        raise OperationalError(f"{PROBE_STATE} is corrupt: {path}")
+    rest = total - sum(split.values())
+    tol = 1e-9 * max(1.0, total)
+    if rest < -tol:
+        raise OperationalError(f"{PROBE_STATE} is corrupt: {path}")
+    if rest > tol:
+        split[Budget.UNATTRIBUTED] = split.get(Budget.UNATTRIBUTED, 0.0) + rest
+    return split
+
+
+def spend_by_model(run_dir: Path, settings: Settings, specs: list[AgentSpec]) -> dict[str, float]:
+    """The run directory's spend (the same total as spend_so_far) split by model: the
+    backtest from the checkpoint's spent_by_model, the control agent at its own model, the
+    probe from probe.json's by_model (a probe.json without it is all hub). Spend that cannot be split (autoresearch, older-model checks, a
+    checkpoint written before per-model tracking) is Budget.UNATTRIBUTED."""
+    run_dir = Path(run_dir)
+    spent = spend_so_far(run_dir)
+    raw = _load_checkpoint(Checkpoint(run_dir / CHECKPOINT)) or {}
+    out: dict[str, float] = {}
+
+    def add(model: str, usd: float) -> None:
+        if usd > 0:
+            out[model] = out.get(model, 0.0) + usd
+
+    bt = raw.get("spent_by_model")
+    if bt is not None:
+        try:
+            split = {str(m): float(v) for m, v in bt.items()}
+        except (AttributeError, TypeError, ValueError):
+            raise OperationalError(f"checkpoint is corrupt (spent_by_model): {run_dir / CHECKPOINT}") from None
+        if not all(math.isfinite(v) and v >= 0 for v in split.values()):
+            raise OperationalError(f"checkpoint is corrupt (spent_by_model): {run_dir / CHECKPOINT}")
+        for m, v in split.items():
+            add(m, v)
+    else:
+        add(Budget.UNATTRIBUTED, spent["backtest"])
+    control = next((sp for sp in specs if sp.kind == "control"), None)
+    add(settings.agent_model(control) if control is not None else Budget.UNATTRIBUTED, spent["control"])
+    for m, v in read_probe_split(run_dir, settings.model).items():  # per model; an old file is all hub
+        add(m, v)
+    add(Budget.UNATTRIBUTED, spent["autoresearch"] + spent["older_model"])
+    return out
 
 
 def _spent_by(spent: dict[str, float], *names: str) -> float:
@@ -751,6 +929,8 @@ def cmd_backtest(args, llm_client=None) -> int:
         print(f"note: {n}")
     if args.dry_run:
         print(f"dry run: zero LLM calls (built-in neutral stub); no keys needed; state in {rc.run_dir}")
+    if args.dry_run or mixed_models(run.settings, run.specs):
+        print("\n".join(models_table(run.settings, run.specs)))
     checkpoint = Checkpoint(rc.path(CHECKPOINT))
     lcd = _last_completed(checkpoint)
     stored = read_stored(rc.run_dir)
@@ -778,8 +958,10 @@ def cmd_backtest(args, llm_client=None) -> int:
     except MissingPriceData as e:
         raise OperationalError(str(e)) from None
     todo = [d for d in all_days if lcd is None or d > lcd]
-    n_agents = sum(1 for sp in run.specs if sp.kind != "control") + (1 if args.with_control else 0)
-    est = estimate_cost(cfg, len(todo), n_agents)
+    # each agent priced at its own model (the control agent at its model when --with-control)
+    est_models = [run.models[sp.name] for sp in run.specs if sp.kind != "control"] + (
+        [run.models[control[0].name]] if args.with_control else [])
+    est = estimate_cost(cfg, len(todo), len(est_models), est_models)
     confirmed = args.yes
     if est > run.settings.confirm_cost_usd:
         if not _confirm(est, run.settings.confirm_cost_usd, args.yes):
@@ -799,7 +981,7 @@ def cmd_backtest(args, llm_client=None) -> int:
                               PredictionLog(rc.path(PREDLOG)), checkpoint, confirm=confirmed,
                               initial_cash=rc.initial_cash, universe_sectors=None,
                               lookback_days=rc.data.lookback_days, macro_series=run.macro_series,
-                              run_dir=rc.run_dir, history_path=rc.path(HISTORY_NAME))
+                              run_dir=rc.run_dir, history_path=rc.path(HISTORY_NAME), error_log=run.errors)
     except RunPaused as e:
         if stored != record:  # the runner accepted the checkpoint: record the (allowed) changes
             _write_json(rc.path(RUN_CONFIG), record)
@@ -849,8 +1031,11 @@ def run_control_pass(run: Run, scores: ScoreStore, result: BacktestResult, all_d
         other = spend_so_far(run.rc.run_dir)  # one hard cap across backtest, control, autoresearch
         remaining = max(0.0, run.settings.budget_usd - result.spent_usd - prev
                         - _spent_by(other, "autoresearch", "probe", "older_model"))
-        llm = CachedLLM(run.llm.client, run.rc.llm_cache_path, run.settings.model,
-                        require_prices(run.settings), remaining)
+        # the control agent's own model (the spoke model when set) with that model's prices; a
+        # private cap of what remains, so llm.spent_usd is the control agent's spend alone
+        model = run.models[spec.name]
+        llm = CachedLLM(run.llms[model].client, run.rc.llm_cache_path, model,
+                        run.settings.prices_for(model), remaining)
     last = max(result.equity.index)
     days = [d for d in all_days if d <= last]
     done = 0
@@ -983,11 +1168,12 @@ class Replay:
             self._snaps[day] = _filter(snap, set(r.universe))
         return DayContext(self._snaps[day], copy.deepcopy(h["weights"]), copy.deepcopy(h["state"]), dict(res))
 
-    def scorer(self, res: AgentResult, day: date) -> tuple[list[float], list[float]]:
-        """Horizon-1 (signed conviction, excess) pairs, as ScoreStore scores them."""
+    def scorer(self, res: AgentResult, day: date):
+        """Horizon-1 (tickers, signed conviction, excess) as ScoreStore scores them."""
+        from atlas.autoresearch.loop import DayPairs
         i = self.all_days.index(day)
         if i + 1 >= len(self.all_days) or res.output is None:
-            return [], []
+            return DayPairs([], [], [])
         nxt = self.all_days[i + 1]
         bench = self.run.pipeline.specs[res.agent].benchmark or BENCHMARK
         rows = {}
@@ -1000,7 +1186,7 @@ class Replay:
             ex = excess_return(tp, bp, 1, self.run.cost_frac, sign)
             if ex == ex:
                 rows[p.ticker] = (sign * p.conviction, ex)
-        return [c for c, _ in rows.values()], [e for _, e in rows.values()]
+        return DayPairs(list(rows), [c for c, _ in rows.values()], [e for _, e in rows.values()])
 
     def run_agent(self, name: str, day: date, prompt: str) -> AgentResult:
         ctx = self.context(day)
@@ -1019,8 +1205,10 @@ def _make_replay(run: Run) -> Replay:
     ckpt = Checkpoint(rc.path(CHECKPOINT))
     if _last_completed(ckpt) is None:
         raise OperationalError(f"no stored run in {rc.run_dir}: run `atlas backtest --config ...` first")
-    ar_failures = FailureLog(rc.path(AR_FAILURES))
-    pipe = Pipeline(run.specs, run.prompts, run.llm, ar_failures, run.universe, run.settings.min_valid_agents)
+    ar_failures = FailureLog(rc.path(AR_FAILURES), error_log=run.errors)
+    # replays route each agent to its own model (same clients, same shared budget as run.llm)
+    pipe = Pipeline(run.specs, run.prompts, run.llm, ar_failures, run.universe, run.settings.min_valid_agents,
+                    llms=run.llms, models=run.models)
     return Replay(run, pipe, run.trading_days(), read_day_history(rc.path(HISTORY_NAME), ckpt),
                   predlog_results(rc.path(PREDLOG)))
 
@@ -1054,7 +1242,8 @@ def train_failure_stats(failures: FailureLog, specs: list[AgentSpec], periods: P
 def cmd_autoresearch(args, llm_client=None) -> int:
     from atlas.autoresearch.gitops import DirtyWorkingTree, GitError, GitOps
     from atlas.autoresearch.loop import (
-        HoldoutViolation, InsufficientReplayDays, last_safe_train_day, run_autoresearch,
+        HoldoutViolation, InsufficientReplayDays, N_CONFIRM_DAYS, last_safe_train_day,
+        run_autoresearch, validation_days,
     )
     rc = load_run_config(args.config)
     refuse_anonymize(rc, "autoresearch")
@@ -1073,7 +1262,25 @@ def cmd_autoresearch(args, llm_client=None) -> int:
           "(run it from a dedicated branch of a clean checkout)")
     run = build_run(rc, fred_key=fred_key, llm_client=llm_client)
     stored_run(rc, run, "autoresearch")  # train/holdout split and settings of the STORED run (ruling U)
+    if agent_models(run.settings, run.specs) != run.models or models_in_use(run.settings, run.specs) != list(run.llms):
+        # cannot happen while model settings stay outside ALLOWED_DRIFT; never replay on other models
+        raise OperationalError("the stored run's agent models differ from the clients built for this command")
     replay = _make_replay(run)
+    if run.settings.confirm_on_validation:
+        # same eligibility as the loop: validation days whose scoring exit is also inside validation
+        eligible = len(validation_days(replay.all_days, run.periods, 1, n=N_CONFIRM_DAYS))  # as the loop uses
+        need = run.settings.confirm_min_days
+        if eligible < need:
+            raise OperationalError(
+                f"autoresearch refused: the validation period gives {eligible} usable trading days (days whose "
+                f"scoring exit is also inside validation, at most {N_CONFIRM_DAYS} are replayed), fewer than confirm_min_days {need}. Every kept edit "
+                f"must be confirmed on validation days: give the validation period at least {need} trading "
+                "days, or set `settings.confirm_on_validation: false` in the config (it may be changed after the "
+                "backtest; edits are then judged on train days alone and the validation confirmation is "
+                "lost). The real requirement is also pair-based: the "
+                f"confirmation needs at least rolling_ic_window ({run.settings.rolling_ic_window}) validation "
+                "pairs, i.e. about rolling_ic_window / picks_per_day days (window 60 with 1-2 picks a day "
+                "needs 30-60 clean days). Each confirmation reuses (spends) the same validation days.")
     spent = spend_so_far(rc.run_dir)
     remaining = run.settings.budget_usd - sum(spent.values())
     if remaining <= 0:
@@ -1270,13 +1477,26 @@ def cmd_report(args, llm_client=None) -> int:
         except (OSError, ValueError):
             raise OperationalError(f"{run_dir / CONTAMINATION} is corrupt; delete it or re-run "
                                    "`atlas probe`") from None
+    errors_path = rc.path(ERRORS_NAME)
+    error_events = None  # unreadable log -> "not provided"; unreadable lines are skipped
+    if not errors_path.exists():
+        # errors.log appears with the first event: a real run (it has a checkpoint) without one is clean
+        error_events = [] if ckpt.path.exists() or (run_dir / PREDLOG).exists() else None
+    elif errors_path.is_file():
+        try:
+            error_events = read_events(errors_path, strict=False)
+        except OSError:
+            error_events = None
     path = build_report(result, scores, null, edits, ablation, None, failures.summary(),
                         sum(spent.values()), run_dir / "report", settings=settings,
                         ablation_by_period=by_period, null_meta=null_meta, null_source=null_src,
                         autoresearch_null_meta=ar_metas,
                         holdout_edit_ics=None, final_weights=final_weights,
                         dropped_picks=failures.dropped_picks_summary(), turnover=turnover,
-                        contamination=contamination)
+                        contamination=contamination, errors=error_events,
+                        **({"agent_models": agent_models(settings, specs),
+                            "spent_by_model": spend_by_model(run_dir, settings, specs)}
+                           if mixed_models(settings, specs) else {}))
     print(f"null distribution: {null_src}; CIO ablation: {'computed' if by_period else 'not provided'}; "
           f"turnover: {'computed' if turnover is not None else 'not provided'}")
     print(f"wrote {path}")
@@ -1323,7 +1543,7 @@ def _is_dry_run_dir(run_dir: Path) -> bool:
 
 def cmd_probe(args, llm_client=None) -> int:
     """(optional) Contamination probe on anonymised snapshots of the stored run's days."""
-    from atlas.backtest.contamination import chance_rates, contamination_probe
+    from atlas.backtest.contamination import PROBE_AGENT, ContaminationScore, chance_rates, contamination_probe
     from atlas.backtest.runner import anonymize_snapshot
     run_dir = Path(args.run_dir)
     if _is_dry_run_dir(run_dir):
@@ -1343,82 +1563,199 @@ def cmd_probe(args, llm_client=None) -> int:
         print(f"note: only {len(pool)} eligible trading days in the run; probing {len(pool)} samples "
               f"instead of {samples}")
         samples = len(pool)
+    in_use = models_in_use(settings, specs)
+    want = getattr(args, "model", None)
+    if want is not None and want not in in_use:
+        raise UsageError(f"--model '{escape_controls(sanitise(str(want), 200))}' is not a model this run uses; "
+                         f"models in use: {', '.join(escape_controls(sanitise(m, 200)) for m in in_use)}")
+    probed = in_use if want is None else [want]
+    try:  # every selected model needs prices (the one cap could not be enforced otherwise)
+        prices = {m: settings.prices_for(m) for m in probed}
+    except UnknownModelPrice as e:
+        raise UsageError(str(e)) from None
     spent = spend_so_far(run_dir)
     remaining = settings.budget_usd - sum(spent.values())
     if remaining <= 0:
         raise OperationalError(f"LLM budget exhausted: ${sum(spent.values()):.2f} of ${settings.budget_usd:.2f} "
                                "already spent on this run (backtest + control + autoresearch + probe + "
                                "older-model checks); raise budget_usd")
-    p_in, p_out = require_prices(settings)
-    est = samples * (settings.est_input_tokens_per_call * p_in + 100 * p_out) / 1e6
+    multi = len(probed) > 1
+    est = sum(samples * (settings.est_input_tokens_per_call * prices[m][0] + 100 * prices[m][1]) / 1e6
+              for m in probed)  # all selected models, before any call
     if est > settings.confirm_cost_usd and not _confirm(est, settings.confirm_cost_usd, args.yes):
         return EXIT_USAGE
-    client = llm_client
-    if client is None:
-        client = anthropic_client(settings)
-    llm = CachedLLM(client, rc.llm_cache_path, settings.model, (p_in, p_out), remaining)
+    if multi:
+        print(f"probing {len(probed)} models on the same {samples} anonymised snapshots "
+              f"(estimated cost ${est:.2f}): " + ", ".join(escape_controls(sanitise(m, 200)) for m in probed))
     universe = list(dict.fromkeys(settings.universe))
     labels = probe_sector_labels(universe)
-    chosen = probe_selection(pool, universe, samples, PROBE_SEED)
+    chosen = probe_selection(pool, universe, samples, PROBE_SEED)  # once: every model sees these
     items = []
     for day, ticker in chosen:
         snap = run.store.snapshot(day, [ticker], rc.data.lookback_days)
         anon, _ = anonymize_snapshot(snap, {ticker: labels[ticker]})
         items.append((anon, day, ticker))
-    failures = FailureLog(run_dir / PROBE_FAILURES)
+    (run_dir / CONTAMINATION).unlink(missing_ok=True)  # an aborted probe must not leave an older result
+    run.errors = open_error_log(run_dir / ERRORS_NAME)
+    failures = FailureLog(run_dir / PROBE_FAILURES, error_log=run.errors)
     prev = _read_spend(run_dir / PROBE_STATE)
+    prev_by = read_probe_split(run_dir, settings.model)
+    # one private cap for all the probe's clients: what remains of the run's one cap (this probe's
+    # earlier spend is already subtracted in `remaining`, so this Budget starts from zero)
+    shared = Budget(remaining)
+    scores: dict[str, ContaminationScore] = {}
+    fatal: FatalApiError | None = None
+    fatal_model = ""
     try:
-        score = contamination_probe(items, llm, settings.tolerance_days, failures=failures,
-                                    max_tokens=settings.max_output_tokens)
+        for m in probed:
+            if fatal is not None or any(sc.budget_exhausted for sc in scores.values()):
+                continue  # the cap is spent or the API rejected a request: later models are not started
+            llm = CachedLLM(client_for(llm_client, settings, m), rc.llm_cache_path, m, prices[m], remaining,
+                            budget=shared)
+            try:
+                scores[m] = contamination_probe(items, llm, settings.tolerance_days, failures=failures,
+                                                max_tokens=settings.max_output_tokens,
+                                                agent=PROBE_AGENT if m == settings.model else f"{PROBE_AGENT}[{m}]")
+            except FatalApiError as e:  # recorded below; re-raised after the results are written
+                fatal, fatal_model = e, m
     finally:
-        _write_json(run_dir / PROBE_STATE, {"spent_usd": prev + llm.spent_usd})
+        this_run = shared.spent_by_model()
+        new_by = dict(prev_by)
+        for m, v in this_run.items():
+            new_by[m] = new_by.get(m, 0.0) + v
+        _write_json(run_dir / PROBE_STATE, {"spent_usd": prev + shared.spent_usd, "by_model": new_by})
     chance_d, chance_t = chance_rates(settings.tolerance_days, len(days), len(universe))
-    by_period: dict[str, dict] = {}
-    for (_, day, _), (dh, th, bad) in zip(items, score.outcomes):
-        b = by_period.setdefault(periods.period_of(day), {"n": 0, "date_hits": 0, "ticker_hits": 0})
-        b["n"] += 1
-        b["date_hits"] += dh
-        b["ticker_hits"] += th
-    for b in by_period.values():
-        b["date_rate"] = b["date_hits"] / b["n"]
-    out = {"n": score.n, "date_hits": score.date_hits, "ticker_hits": score.ticker_hits,
-           "any_hits": score.any_hits, "rate": score.rate, "date_rate": score.date_rate,
-           "ticker_rate": score.ticker_rate, "chance_date_rate": chance_d, "chance_ticker_rate": chance_t,
-           "n_trading_days": len(days), "universe_size": len(universe), "by_period": by_period,
-           "failed": score.failed, "budget_exhausted": score.budget_exhausted,
-           "tolerance_days": settings.tolerance_days, "seed": PROBE_SEED, "model": settings.model,
-           "requested_samples": samples, "spent_usd": prev + llm.spent_usd,
-           "samples": [{"date": d.isoformat(), "ticker": t} for _, d, t in items[:score.n]]}
-    _write_json(run_dir / CONTAMINATION, out)
-    if score.empty:
-        print("contamination probe (optional): no probe completed"
-              + (" (LLM budget exhausted)" if score.budget_exhausted else "") + f"; wrote {run_dir / CONTAMINATION}")
-        return EXIT_OK
-    per = "; ".join(f"{k} {v['date_hits']}/{v['n']}" for k, v in by_period.items()) if len(by_period) > 1 else ""
-    print(f"contamination probe (optional): the model ({settings.model}) placed {score.date_hits} of "
-          f"{score.n} anonymised snapshots within {settings.tolerance_days} days of the true date "
-          f"(date-hit rate {score.date_rate:.1%}; a random guesser would manage about {chance_d:.1%}, "
-          f"approximate)" + (f"; by period: {per}" if per else "") + f". Ticker hits {score.ticker_hits} of "
-          f"{score.n} (chance about {chance_t:.1%}; the sector label may identify the ticker, so ticker hits "
-          f"are not evidence of date memory). Seed {PROBE_SEED}; spend ${llm.spent_usd:.4f}. A high date-hit "
-          "rate, well above chance, means the model can place these snapshots in time, so trust results for "
-          "those periods less. It is not a measure of skill. "
-          f"Wrote {run_dir / CONTAMINATION}; `atlas report` will include it.")
-    if score.budget_exhausted:
-        print(f"note: stopped early: LLM budget exhausted after {score.n} of {samples} probes")
-    if score.failed == score.n:
-        print(f"error: all {score.n} probe replies were unusable (see {run_dir / PROBE_FAILURES}); is "
-              f"'{settings.model}' reachable and returning JSON?", file=sys.stderr)
-        return EXIT_FAILED
-    return EXIT_OK
+
+    def entry(m: str) -> dict:
+        sc = scores.get(m)
+        spend = new_by.get(m, 0.0)
+        if m == fatal_model:  # the API rejected a request: its partial replies are not kept
+            return {"n": 0, "date_hits": 0, "ticker_hits": 0, "any_hits": 0, "rate": 0.0, "date_rate": 0.0,
+                    "ticker_rate": 0.0, "failed": 0, "chance_date": chance_d, "chance_ticker": chance_t,
+                    "spend_usd": spend, "by_period": {}, "requested_samples": samples,
+                    "budget_exhausted": False, "incomplete": True, "skipped": False, "failed_fatal": True,
+                    "error": escape_controls(sanitise(str(fatal), 300))}
+        if sc is None:  # never started: an earlier model used up the cap
+            return {"n": 0, "date_hits": 0, "ticker_hits": 0, "any_hits": 0, "rate": 0.0, "date_rate": 0.0,
+                    "ticker_rate": 0.0, "failed": 0, "chance_date": chance_d, "chance_ticker": chance_t,
+                    "spend_usd": spend, "by_period": {}, "requested_samples": samples,
+                    "budget_exhausted": False, "incomplete": True, "skipped": True}
+        by_period: dict[str, dict] = {}
+        for (_, day, _), (dh, th, bad) in zip(items, sc.outcomes):
+            b = by_period.setdefault(periods.period_of(day), {"n": 0, "date_hits": 0, "ticker_hits": 0})
+            b["n"] += 1
+            b["date_hits"] += dh
+            b["ticker_hits"] += th
+        for b in by_period.values():
+            b["date_rate"] = b["date_hits"] / b["n"]
+        return {"n": sc.n, "date_hits": sc.date_hits, "ticker_hits": sc.ticker_hits, "any_hits": sc.any_hits,
+                "rate": sc.rate, "date_rate": sc.date_rate, "ticker_rate": sc.ticker_rate, "failed": sc.failed,
+                "chance_date": chance_d, "chance_ticker": chance_t, "spend_usd": spend, "by_period": by_period,
+                "requested_samples": samples, "budget_exhausted": sc.budget_exhausted,
+                "incomplete": sc.budget_exhausted or sc.n < samples, "skipped": False}
+
+    models_out = {m: entry(m) for m in probed}
+    head = probed[0]  # the hub, unless --model restricted the run: top-level fields are this model's
+    hs, he = scores.get(head) or ContaminationScore(n=0, date_hits=0, ticker_hits=0, rate=0.0), models_out[head]
+    out = {"n": hs.n, "date_hits": hs.date_hits, "ticker_hits": hs.ticker_hits,
+           "any_hits": hs.any_hits, "rate": hs.rate, "date_rate": hs.date_rate,
+           "ticker_rate": hs.ticker_rate, "chance_date_rate": chance_d, "chance_ticker_rate": chance_t,
+           "n_trading_days": len(days), "universe_size": len(universe), "by_period": he["by_period"],
+           "failed": hs.failed, "budget_exhausted": hs.budget_exhausted,
+           "tolerance_days": settings.tolerance_days, "seed": PROBE_SEED, "model": head,
+           "requested_samples": samples, "spent_usd": prev + shared.spent_usd,
+           "samples": [{"date": d.isoformat(), "ticker": t} for _, d, t in items[:hs.n]],
+           "models": models_out, "models_in_use": in_use, "probed_models": probed}
+    _write_json(run_dir / CONTAMINATION, out)  # also after a fatal error: no stale file survives
+    if fatal is not None:
+        raise fatal
+    esc = lambda x: escape_controls(sanitise(str(x), 200))  # noqa: E731
+    rc_out = EXIT_OK
+    for m in probed:
+        sc = scores.get(m)
+        who = f" for {esc(m)}" if multi else ""
+        if sc is None:
+            print(f"note: {esc(m)} was not probed: the LLM budget was exhausted by an earlier model")
+            continue
+        spend = this_run.get(m, 0.0)
+        if sc.empty:
+            print("contamination probe (optional): no probe completed" + who
+                  + (" (LLM budget exhausted)" if sc.budget_exhausted else "") + f"; wrote {run_dir / CONTAMINATION}")
+            continue
+        by_period = models_out[m]["by_period"]
+        per = "; ".join(f"{k} {v['date_hits']}/{v['n']}" for k, v in by_period.items()) if len(by_period) > 1 else ""
+        print(f"contamination probe (optional): the model ({esc(m)}) placed {sc.date_hits} of "
+              f"{sc.n} anonymised snapshots within {settings.tolerance_days} days of the true date "
+              f"(date-hit rate {sc.date_rate:.1%}; a random guesser would manage about {chance_d:.1%}, "
+              f"approximate)" + (f"; by period: {per}" if per else "") + f". Ticker hits {sc.ticker_hits} of "
+              f"{sc.n} (chance about {chance_t:.1%}; the sector label may identify the ticker, so ticker hits "
+              f"are not evidence of date memory). Seed {PROBE_SEED}; spend ${spend:.4f}. A high date-hit "
+              "rate, well above chance, means the model can place these snapshots in time, so trust results for "
+              "those periods less. It is not a measure of skill. "
+              f"Wrote {run_dir / CONTAMINATION}; `atlas report` will include it.")
+        if sc.budget_exhausted:
+            print(f"note: stopped early{who}: LLM budget exhausted after {sc.n} of {samples} probes")
+        if sc.failed == sc.n:
+            print(f"error: all {sc.n} probe replies{who} were unusable (see {run_dir / PROBE_FAILURES}); is "
+                  f"'{esc(m)}' reachable and returning JSON?", file=sys.stderr)
+            rc_out = EXIT_FAILED
+    return rc_out
 
 
 # ============================================================================ entry point
 
+def cmd_errors(args, llm_client=None) -> int:
+    """Print the tail of <run-dir>/errors.log. Read-only: creates nothing."""
+    run_dir = Path(args.run_dir)
+    path = run_dir / ERRORS_NAME
+    if not path.is_file():
+        raise OperationalError(f"no error log in {run_dir}")
+    skipped: list[int] = []
+    try:
+        events = read_events(path, kind=args.kind, strict=False, skipped=skipped)
+    except (OSError, ValueError) as e:
+        raise OperationalError(f"cannot read {path}: {e}") from None
+    if skipped:
+        print(f"warning: skipped {len(skipped)} malformed line(s) in {path}", file=sys.stderr)
+
+    def cell(ev: dict, k: str) -> str:  # stored text is data: re-sanitised, never raw bytes
+        v = ev.get(k)
+        return escape_controls(sanitise("" if v is None else str(v), 500)) if v not in (None, "") else (
+            "" if k == "message" else "-")
+
+    try:
+        for ev in events[-args.tail:] if args.tail > 0 else []:
+            print(" ".join(cell(ev, k) for k in ("ts_utc", "level", "kind", "day", "agent", "reason",
+                                                  "message")).rstrip())
+        sys.stdout.flush()
+    except BrokenPipeError:
+        _quiet_broken_pipe()
+    return EXIT_OK
+
+
+def _flush_stdout() -> None:
+    """Flush stdout at the end of a command. A reader that left (`atlas report | head`) is not a
+    bug, but ONLY a failed write/flush of stdout itself is treated so; any other BrokenPipeError
+    (socket, subprocess, file) is not caught here and reaches the unexpected_exception path."""
+    try:
+        sys.stdout.flush()
+    except BrokenPipeError:
+        _quiet_broken_pipe()
+
+
+def _quiet_broken_pipe() -> None:
+    """The reader closed the pipe (`| head`): not a bug. Point stdout at devnull so the flush at
+    interpreter exit cannot raise (the recipe in the Python docs)."""
+    try:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    except Exception:  # noqa: BLE001 - e.g. a captured stdout without a file descriptor
+        pass
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="atlas", description="ATLAS backtest system: multi-agent LLM "
                                 "trading research with honest, leakage-aware evaluation.")
-    sub = p.add_subparsers(dest="command", required=True, metavar="{backtest,calibrate,autoresearch,report,probe}")
+    sub = p.add_subparsers(dest="command", required=True, metavar="{backtest,calibrate,autoresearch,report,probe,errors}")
     b = sub.add_parser("backtest", help="run or resume a backtest over train, validation and holdout")
     b.add_argument("--config", required=True, help="run config YAML (see atlas/config/run.example.yaml)")
     b.add_argument("--dry-run", action="store_true", help="no keys, zero LLM calls: plumbing check")
@@ -1440,12 +1777,21 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--samples", type=int, default=PROBE_DEFAULT_SAMPLES,
                    help="(optional) number of snapshots to probe, spread over the run's days "
                         "(default %(default)s)")
+    q.add_argument("--model", help="(optional) probe only this one model in use (default: every model in "
+                   "use: hub, spoke and per-agent overrides). The top-level fields of contamination.json "
+                   "are then this model's (see `model`), and the run overwrites the file's models")
     q.add_argument("--yes", action="store_true", help="do not ask before spending above confirm_cost_usd")
+    e = sub.add_parser("errors", help="print the run's error log (errors.log), oldest of the last N first",
+                       description="Read-only: print the last events of the run's errors.log, one line "
+                       "each: ts level kind day agent reason message. Needs no keys and no config.")
+    e.add_argument("--run-dir", required=True, help="a run directory (or its dry_run subdirectory)")
+    e.add_argument("--tail", type=int, default=20, help="show the last N events (default %(default)s)")
+    e.add_argument("--kind", help="only events of this kind (e.g. fatal_api_error, run_paused)")
     return p
 
 
 COMMANDS = {"backtest": cmd_backtest, "calibrate": cmd_calibrate, "autoresearch": cmd_autoresearch,
-            "report": cmd_report, "probe": cmd_probe}
+            "report": cmd_report, "probe": cmd_probe, "errors": cmd_errors}
 
 
 def main(argv: list[str] | None = None, *, llm_client=None) -> int:
@@ -1459,18 +1805,42 @@ def main(argv: list[str] | None = None, *, llm_client=None) -> int:
         logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
     # urllib3 logs request lines at DEBUG, and the FRED request line carries api_key in its query
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+    global ACTIVE_ERRORLOG
+    ACTIVE_ERRORLOG = None
+
     try:
-        return COMMANDS[args.command](args, llm_client=llm_client)
+        code = COMMANDS[args.command](args, llm_client=llm_client)
+        _flush_stdout()
+        return code
     except UsageError as e:
+        _record_known("usage_error", e)
         print(f"error: {e}", file=sys.stderr)
         return EXIT_USAGE
     except (OperationalError, ResumeRefused, FredFetchError, MissingPriceData) as e:
+        kind = ("resume_refused" if isinstance(e, ResumeRefused) else
+                "data_error" if isinstance(e, (FredFetchError, MissingPriceData)) else "operational_error")
+        _record_known(kind, e)
         print(f"error: {e}", file=sys.stderr)
         return EXIT_FAILED
     except FatalApiError as e:  # never retried; the message is already sanitised
+        _record_known("fatal_api_error", e)
         print(f"error: {e}. Nothing was retried and any checkpoint is intact: fix the cause (model name, "
               "API key, settings such as effort) and re-run the same command.", file=sys.stderr)
         return EXIT_FAILED
+    except Exception as e:  # noqa: BLE001 - last resort: one line, never a traceback (Ctrl-C/exit pass)
+        _record_known("unexpected_exception", e)
+        where = f" (details: {ACTIVE_ERRORLOG.path})" if ACTIVE_ERRORLOG is not None and ACTIVE_ERRORLOG.path else ""
+        print(f"error: unexpected {type(e).__name__}: {escape_controls(sanitise(str(e)))}{where}", file=sys.stderr)
+        return EXIT_FAILED
+
+
+def _record_known(kind: str, exc: BaseException) -> None:
+    """Record to the active run's error log (if any) before the error is printed; never raises."""
+    try:
+        if ACTIVE_ERRORLOG is not None:
+            ACTIVE_ERRORLOG.exception(kind, exc)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 if __name__ == "__main__":  # pragma: no cover

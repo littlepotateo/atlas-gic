@@ -274,9 +274,11 @@ def test_paired_replay_computes_rank_ic_on_identical_days():
 def test_holdout_days_never_passed_to_replay(tmp_path, prompt_repo):
     seen = []
     run(tmp_path, prompt_repo, make=fake_run_one_day(seen=seen))
-    days = sorted({d for _, d, _ in seen})
+    allseen = sorted({d for _, d, _ in seen})
+    # validation confirmation (test_confirmation.py) replays validation days; never holdout
+    assert all(d < PERIODS.holdout[0] for d in allseen)
+    days = [d for d in allseen if d <= TRAIN[1]]
     assert days, "replay ran"
-    assert all(TRAIN[0] <= d <= TRAIN[1] for d in days)
     # the 1-day exit of every replay day must also lie in train: the last train day is dropped
     for d in days:
         exit_day = TRADING_DAYS[TRADING_DAYS.index(d) + 1]
@@ -476,6 +478,32 @@ def test_insufficient_replay_data_is_recorded_and_loop_continues(tmp_path, promp
     assert branches(prompt_repo) == ["main"]
 
 
+def test_malformed_new_side_output_rejects_the_edit_old_side_stays_loud(tmp_path, prompt_repo):
+    from atlas.autoresearch.loop import DayPairs
+
+    def broken(bad_new):
+        def make(agent):
+            def run(day, prompt):
+                is_new = prompt.endswith(NEW_SUFFIX)
+                if is_new == bad_new:
+                    return DayPairs(["A", "B"], [0.1, 0.2, 0.3], [0.1, 0.2, 0.3])
+                return DayPairs(["A", "B", "C"], [0.1, 0.2, 0.3], [0.1, 0.2, 0.3])
+            run.horizon = 1
+            return run
+        return make
+
+    base = git(prompt_repo, "rev-parse", "main")
+    recs = run(tmp_path, prompt_repo, make=broken(True), cfg=settings(max_edits=2))
+    assert [r.decision for r in recs] == ["rejected", "rejected"]
+    assert all("malformed" in r.reason for r in recs)
+    assert git(prompt_repo, "rev-parse", "main") == base and branches(prompt_repo) == ["main"]
+    tmp2 = tmp_path / "b"
+    tmp2.mkdir()
+    with pytest.raises(ValueError, match="tickers"):
+        run(tmp2, prompt_repo, make=broken(False))
+    assert branches(prompt_repo) == ["main"]
+
+
 def test_original_branch_restored_and_used_as_merge_base(tmp_path, prompt_repo):
     git(prompt_repo, "checkout", "-q", "-b", "work")
     main_sha = git(prompt_repo, "rev-parse", "main")
@@ -494,7 +522,7 @@ def test_log_line_written_per_attempt(tmp_path, prompt_repo):
     lines = log_lines(tmp_path)
     assert len(lines) == 2
     assert set(lines[0]) == {"agent", "branch", "n_days", "old_ic", "new_ic", "diff", "keep_margin",
-                             "decision", "reason", "commit_sha", "cost_usd", "null_test"}
+                             "decision", "reason", "commit_sha", "cost_usd", "null_test", "confirm", "gates"}
     assert lines[0]["null_test"] is None  # optional: set when run_autoresearch gets null_test_meta
     assert lines[0]["agent"] == recs[0].agent and lines[0]["branch"] == "autoresearch/agent_a-0"
     assert lines[1]["branch"] == "autoresearch/agent_b-1"
@@ -568,12 +596,17 @@ def test_end_to_end_with_stub_model_and_real_pipeline(tmp_path, prompt_repo):
     assert r.new_ic > 0.8 and abs(r.old_ic) < 0.3 and r.n_days == 60
     assert (prompt_repo / "atlas/prompts/agent_a.md").read_text() == PROMPT_A + NEW_SUFFIX
     # unchanged agent: one live call per replay day despite two replays (the rest are cache hits)
+    # (60 train replay days, then 60 validation confirmation days)
     b_calls = [c for c in calls if c[0] == "agent_b"]
-    assert len(b_calls) == 60 and len({c[1] for c in b_calls}) == 60
+    assert len(b_calls) == 120 and len({c[1] for c in b_calls}) == 120
     a_new = [c for c in calls if c[0] == "agent_a" and c[2]]
     a_old = [c for c in calls if c[0] == "agent_a" and not c[2]]
-    assert len(a_new) == 60 and len(a_old) == 60
-    assert all(date.fromisoformat(c[1]) < LAST_TRAIN_DAY for c in calls)
+    assert len(a_new) == 120 and len(a_old) == 120
+    train_calls = [c for c in calls if date.fromisoformat(c[1]) <= TRAIN[1]]
+    assert len(train_calls) == 180 and all(date.fromisoformat(c[1]) < LAST_TRAIN_DAY for c in train_calls)
+    assert all(PERIODS.validation[0] <= date.fromisoformat(c[1]) < PERIODS.validation[1]
+               for c in calls if c not in train_calls)
+    assert r.confirm["passed"] is True and r.confirm["n_days"] == 60
     assert r.cost_usd > 0
 
 
@@ -640,7 +673,7 @@ def test_pair_count_collapse_is_rejected(tmp_path, prompt_repo):
         return with_horizon(run_one)
 
     recs = run(tmp_path, prompt_repo, make=make, keep_margin=0.1)
-    assert recs[0].decision == "rejected" and "80%" in recs[0].reason
+    assert recs[0].decision == "rejected" and "min_pair_ratio" in recs[0].reason
     # fewer pairs than the window keep_margin was calibrated on
     recs = run(tmp_path, prompt_repo, cfg=settings(rolling_ic_window=400), keep_margin=0.1)
     assert recs[-1].decision == "rejected" and "rolling_ic_window" in recs[-1].reason
@@ -657,12 +690,12 @@ def test_equal_failures_with_real_gain_still_kept(tmp_path, prompt_repo):
 
 def test_edit_gate_thresholds():
     cfg = settings(rolling_ic_window=60, max_failure_rate=0.2)
-    ok = PairedResult(0.0, 0.3, 60, 0.3, old_failures=1, new_failures=4, old_pairs=300, new_pairs=240,
+    ok = PairedResult(0.0, 0.3, 60, 0.3, old_failures=1, new_failures=4, old_pairs=300, new_pairs=285,
                       n_days_requested=60)
-    assert edit_gate(ok, cfg) is None  # tolerance max(2, 3) = 3 extra failures, 80% pairs exactly
+    assert edit_gate(ok, cfg) is None  # tolerance max(2, 3) = 3 extra failures, 95% pairs exactly
     from dataclasses import replace
     assert edit_gate(replace(ok, new_failures=5), cfg) is not None
-    assert edit_gate(replace(ok, new_pairs=239), cfg) is not None
+    assert edit_gate(replace(ok, new_pairs=284), cfg) is not None
     assert edit_gate(replace(ok, new_pairs=59, old_pairs=59), cfg) is not None
     assert edit_gate(replace(ok, old_failures=13, new_failures=13), cfg) is not None  # > 20%
     assert edit_gate(replace(ok, new_empty=4), cfg) is not None
@@ -809,3 +842,23 @@ def test_null_test_meta_is_recorded_in_every_log_line(tmp_path, prompt_repo):
     lines = log_lines(tmp_path)
     assert len(lines) == 2 and all(line["null_test"] == meta for line in lines)
     assert all(r.null_test == meta for r in recs)
+
+
+def _pair_result(new_pairs, old_pairs=100):
+    return PairedResult(0.0, 0.3, 60, 0.3, old_failures=0, new_failures=0, old_pairs=old_pairs,
+                        new_pairs=new_pairs, n_days_requested=60)
+
+
+def test_gate_rejects_ninety_percent_of_pairs_by_default():
+    why = edit_gate(_pair_result(90), settings(rolling_ic_window=60))
+    assert why is not None and "min_pair_ratio" in why
+
+
+def test_gate_accepts_at_exactly_the_ratio():
+    assert edit_gate(_pair_result(95), settings(rolling_ic_window=60)) is None
+    assert edit_gate(_pair_result(94), settings(rolling_ic_window=60)) is not None
+
+
+def test_pair_ratio_setting_is_honoured():
+    assert edit_gate(_pair_result(90), settings(rolling_ic_window=60, min_pair_ratio=0.8)) is None
+    assert edit_gate(_pair_result(79), settings(rolling_ic_window=60, min_pair_ratio=0.8)) is not None
