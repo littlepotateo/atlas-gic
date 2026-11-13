@@ -157,7 +157,8 @@ class ErrorLog:
                     _warn_once(e)
             fd = os.open(self.path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
             try:
-                os.fchmod(fd, 0o600)
+                if hasattr(os, "fchmod"):  # not available on Windows; the file is still created
+                    os.fchmod(fd, 0o600)
                 end = os.fstat(fd).st_size
                 if end > 0 and os.pread(fd, 1, end - 1) != b"\n":
                     marker = self._record("log_repaired", "torn final line set aside", "warning",
