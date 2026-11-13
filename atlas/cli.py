@@ -1801,6 +1801,12 @@ def main(argv: list[str] | None = None, *, llm_client=None) -> int:
         args = parser.parse_args(argv)
     except SystemExit as e:
         return int(e.code) if isinstance(e.code, int) else EXIT_USAGE
+    try:
+        from atlas.envfile import load_env_files
+        load_env_files()  # fills unset variables from .env / ~/.config/atlas/.env (exported ones win)
+    except Exception as e:  # an explicit ATLAS_ENV_FILE that cannot be read is a usage error
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_USAGE
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
     # urllib3 logs request lines at DEBUG, and the FRED request line carries api_key in its query
