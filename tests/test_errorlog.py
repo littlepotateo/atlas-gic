@@ -282,3 +282,18 @@ def test_read_events_directory_and_blank_lines(tmp_path):
     g = json.dumps({"kind": "k"})
     p.write_text("\n" + g + "\n\n   \n" + g + "\n\n")
     assert len(read_events(p)) == 2
+
+
+def test_log_is_written_when_os_has_no_fchmod(tmp_path, monkeypatch):
+    # Windows has no os.fchmod: the event must still be written, with no warning
+    import builtins
+    from atlas.errorlog import ErrorLog, read_events
+    monkeypatch.delattr(os, "fchmod", raising=False)
+    warned = []
+    monkeypatch.setattr(builtins, "print", lambda *a, **k: warned.append(a))
+    import atlas.errorlog as el
+    monkeypatch.setattr(el, "_warned", False)
+    path = tmp_path / "errors.log"
+    ErrorLog(path).event("probe_check", "hello")
+    assert [e["kind"] for e in read_events(path)] == ["probe_check"]
+    assert warned == []
